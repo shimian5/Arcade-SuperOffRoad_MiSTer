@@ -12,6 +12,8 @@ implementation — this is not a sample-playback stand-in, it's the Leland
 sound board's architecture (80186 core + 8253 PIT + DAC/mixer) recreated
 in RTL and driven by the game's real sound ROM.
 
+#### Known Issues - CRT/Analog video no sync. Working to resolve but for now HDMI only
+
 | Subsystem | Status |
 |---|---|
 | Master/Slave Z80 (game logic, bankswitching, EEPROM) | Working |
