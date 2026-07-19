@@ -1,0 +1,104 @@
+## Super Off Road — MiSTer FPGA Core
+## Source file list for Quartus
+## Do NOT edit in Quartus IDE — add files here manually.
+
+## ── tv80 Z80 CPU core (submodule: rtl/tv80) ─────────────────────────
+## Pure Verilog — compiles cleanly on Quartus 17 Lite (no VHDL parser crash).
+## tv80s_ce.v is a local wrapper that exposes the cen clock-enable port.
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_alu.v
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_reg.v
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_mcode.v
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_core.v
+set_global_assignment -name VERILOG_FILE rtl/tv80s_ce.v
+
+## ── Core RTL ─────────────────────────────────────────────────────────
+set_global_assignment -name SYSTEMVERILOG_FILE SuperOffRoad.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/steering_input.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_vram_port.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_board.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_master.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_slave.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_video.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_dpram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_eeprom_93c46.sv
+
+## ── Chunk 3 additions (Slave Z80 + real video) ─────────────────────
+## Uncomment when ready:
+## set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_tile_renderer.sv
+
+## ── WP10 (docs/planning_80186_sound.md): S80186 sound board ─────────
+## Real chain: vendored s80x86 core (rtl/s80x86, GPLv3, see its own
+## README_VENDORING.md) + i186_periph (WP2-4,8) + KF8253 PIT8254
+## (rtl/KF8253, MIT) + leland_sound_board (WP6) + leland_dac_mixer
+## (WP7), bundled by rtl/sor_sound.sv. File order matches
+## sim/s80x86_core_filelist.f (config.v's `define must precede Flags.sv,
+## which reads it directly with no `include -- Verilog macro visibility
+## is whole-project/file-order-dependent, same reasoning as ModelSim's
+## -mfcu requirement documented in docs/WP1_PROGRESS.md).
+set_global_assignment -name SEARCH_PATH rtl/KF8253
+set_global_assignment -name SEARCH_PATH rtl/s80x86/microcode
+set_global_assignment -name VERILOG_FILE rtl/s80x86/config.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/microcode/MicrocodeTypes.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/FlagsEnum.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/aaa.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/aas.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/adc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/add.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/and.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/bound.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/daa.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/das.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/enter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/extend.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/flags.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/mul.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/or.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/not.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/rcl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/rcr.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/rol.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/ror.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/sar.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/shift_flags.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/shl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/shr.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/sub.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/xor.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/alu/ALU.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/RegisterEnum.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/Instruction.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/InstructionDefinitions.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/InsnDecoder.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/microcode/Microcode.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/Core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/CSIPSync.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/Divider.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/Fifo.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/Flags.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/ImmediateReader.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/IP.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/JumpTest.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/LoadStore.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/LoopCounter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/ModRMDecode.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/PosedgeToPulse.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/Prefetch.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/RegisterFile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/SegmentOverride.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/SegmentRegisterFile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/TempReg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/cdc/BitSync.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/cdc/MCP.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/cdc/SyncPulse.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/s80x86/MemArbiter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/KF8253/KF8253_Counter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/KF8253/KF8253_Control_Logic.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/KF8253/KF8253.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/KF8253/kf8253_leland_bus.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/i186_periph.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/leland_sound_board.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/leland_dac_mixer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_sound.sv
+
+set_global_assignment -name SDC_FILE SuperOffRoad.sdc
