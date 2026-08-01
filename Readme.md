@@ -22,6 +22,21 @@ in RTL and driven by the game's real sound ROM.
 | Controls (spinner, digital d-pad, analog stick, digital gas) | Working |
 | DIP switches (lives, difficulty, service, free play) | Working |
 
+### Supported games
+
+This started as a Super Off-Road-only core. **Pig Out: Dine Like a
+Swine!** (`pigout`) now also boots and plays on the same bitstream, along
+with the Super Off-Road Track-Pak (`offroadt`) update set — each has its
+own MRA under `releases/`. The board isn't generic across the whole
+Leland catalog yet; these are the games verified so far, not a claim of
+full Leland-family support.
+
+| Game | Set | Status |
+|---|---|---|
+| Ironman Ivan Stewart's Super Off-Road | `offroad` | Working |
+| Super Off-Road Track-Pak | `offroadt` | Working |
+| Pig Out: Dine Like a Swine! | `pigout` | Working |
+
 A note on accuracy: this core was developed by studying MAME's Leland
 drivers and the game ROMs — it has not been verified against an original
 PCB, and MAME itself is an emulator rather than a hardware model. Expect
@@ -66,12 +81,14 @@ Produces `output_files/SuperOffRoad.rbf`.
 
 Copy to your MiSTer:
 
-- `output_files/SuperOffRoad.rbf` → `/media/fat/_Arcade/cores/`
-- `mra/SuperOffRoad.mra` → `/media/fat/_Arcade/`
+- `output_files/SuperOffRoad.rbf` (or the prebuilt one under `releases/`)
+  → `/media/fat/_Arcade/cores/`
+- The MRA for whichever game(s) you want, from `releases/` →
+  `/media/fat/_Arcade/`
 
-You'll need the `offroad` ROM set (MAME 0.257) — this repo does not
-include or distribute any ROM/PROM data, per usual MiSTer arcade-core
-convention.
+You'll need the matching MAME 0.257 ROM set for each game (`offroad`,
+`offroadt`, or `pigout`) — this repo does not include or distribute any
+ROM/PROM data, per usual MiSTer arcade-core convention.
 
 ## Simulation
 
