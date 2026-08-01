@@ -93,6 +93,15 @@ module sdram_simple #(
     input  logic [ADDR_W-1:0]            addr,
     input  logic [7:0]                   din,
     output logic [7:0]                   dout,
+    // Full captured 16-bit word, unmuxed by addr[0] -- exists alongside
+    // `dout` (unchanged) so a caller doing a deliberate word-aligned read
+    // can get both bytes from one transaction instead of two (2026-07-22,
+    // wider-reads bandwidth fix -- see rtl/sor_video.sv's FP_GFX01_REQ/
+    // WAIT). Every read already captures the full word into rdata_reg
+    // regardless of which single byte `dout` exposes, so this is a pure
+    // additive expose of data already being read off the bus, not an
+    // extra memory access.
+    output logic [15:0]                  dout16,
     input  logic                         rd,
     input  logic                         we,
     output logic                         ready,
@@ -315,13 +324,28 @@ module sdram_simple #(
     // =================================================================
     // Read data: capture 16-bit word from DQ at the CL-offset cycle,
     // then mux the selected byte to `dout`.
-    // =================================================================
+    //
+    // WP-L3 96MHz investigation (2026-07-22): TimeQuest showed
+    // read_capture_sr[0] -> rdata_reg's DDIO "ena" pin missing setup by
+    // -6.6ns at 96MHz. Two retiming attempts (a same-value register with
+    // (* preserve *), then a 2-stage unconditional-capture relay) both
+    // failed to close it and one introduced a functional off-by-one bug
+    // in the process -- in both cases Quartus's Fast Fit fitter simply
+    // placed the new register far from where it needed to be, with
+    // clock skew actually getting WORSE on the second attempt. That
+    // pointed at the real root cause: `FITTER_EFFORT "FAST FIT"` in
+    // SuperOffRoad.qsf trades placement quality for compile speed, and
+    // this path's whole problem was poor placement, not register
+    // structure. Reverted this module to its original, functionally
+    // simple, empirically-correct form -- see SuperOffRoad.qsf's
+    // FITTER_EFFORT comment for the actual fix being tried instead.
     logic [15:0] rdata_reg;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) rdata_reg <= '0;
         else if (read_capture_sr[0]) rdata_reg <= sd_dq_in;
     end
-    assign dout = rq_byte_sel ? rdata_reg[15:8] : rdata_reg[7:0];
+    assign dout   = rq_byte_sel ? rdata_reg[15:8] : rdata_reg[7:0];
+    assign dout16 = rdata_reg;
 
     // =================================================================
     // Combinational next-command / address / data (drives *_nxt, then

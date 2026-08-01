@@ -83,20 +83,14 @@ module sor_slave
 	output        rom_req,    // level: high during any ROM read machine cycle
 	input         rom_stall,  // high = data not ready; insert Z80 wait states
 
-	//------------------------------------------------------------------
-	// Debug taps (Follow-up 6, docs/SESSION_2026-07-14.md) -- hardware
-	// evidence for whether the organic `ld ($C000),a` bank switch (fixed
-	// in commit 7ec580f) actually latches on real silicon. Minimal: a
-	// PC latch mirroring dbg_pc's M1-fetch convention in sor_master.sv,
-	// the live bank_reg value, two small saturating/rolling counters,
-	// and one sticky flag. No new BRAM, no wide comparators.
-	//------------------------------------------------------------------
-	output [15:0] dbg_pc,             // Slave PC latched at each opcode fetch (M1)
-	output  [3:0] dbg_bank_reg,       // live bank_reg value
-	output  [7:0] dbg_bank_wr_cnt,    // saturating count of accepted 0xC000 writes
-	output  [3:0] dbg_bank_max,       // max bank value ever written to 0xC000
-	output [15:0] dbg_vram_wr_cnt,    // rolling (wrapping) count of accepted VRAM-port write ops
-	output        dbg_banked_read_ever // sticky: a banked-window (0x4000-0xBFFF) ROM read ever completed
+	// Debug-overlay use only (2026-07-25): raw level of the internal
+	// vport_stall wire below, exposed so sor_board.sv can build a
+	// per-frame "slave VRAM-port stall ticks" counter distinct from the
+	// ROM-fetch stall above -- see vport_stall's own comment for why
+	// this is a real board cost, not purely ours. Not consumed by any
+	// game-logic path; safe to leave unconnected/ignored by any other
+	// instantiation.
+	output        vport_stall_out
 );
 
 //------------------------------------------------------------------
@@ -138,10 +132,18 @@ assign rom_req = rom_read_cyc;
 // holds the CPU with /WAIT instead of ever silently overwriting a
 // not-yet-drained VRAM port op. See sor_vram_port.sv's vp_stall comment.
 wire vport_stall;
+assign vport_stall_out = vport_stall;
 
 // Insert wait states when SDRAM has not yet returned ROM data, or the
 // VRAM port isn't ready to accept a new op yet.
-wire cpu_wait_n = ~((rom_read_cyc & rom_stall) | vport_stall);
+`ifdef NO_STALL_CONTROL
+	// Measurement-only control knob (see sor_master.sv's identical guard and
+	// docs/SESSION_2026-07-24_..._HANDOFF.md): neutralize the ROM-fetch
+	// stall term for the slave Z80 too. Absent this define, bit-identical.
+	wire cpu_wait_n = ~vport_stall;
+`else
+	wire cpu_wait_n = ~((rom_read_cyc & rom_stall) | vport_stall);
+`endif
 
 tv80s_ce #(.Mode(0), .T2Write(1), .IOWait(1)) slave_cpu
 (
@@ -176,8 +178,12 @@ assign slave_halt_n = halt_n;
 //   if (bankaddress >= slave region length (0x80000)) bankaddress = 0x10000;
 // i.e. bank_reg >= 14 falls back to 0x10000 (same as bank_reg==0).
 //
-// Slave ROM layout (from SuperOffRoad.mra / ioctl_index 0x01), unchanged
-// by this fix -- this is the flat SDRAM image the arithmetic indexes into:
+// Slave ROM layout (from mra/SuperOffRoad.mra, single index="0" session),
+// unchanged by this fix -- these are offsets WITHIN the slave ROM region
+// (rtl/leland_board_pkg.sv ADDR_SLAVE_BASE, canonically 0x100000 in the
+// post-header SDRAM address space; sor_board.sv adds that base to this
+// module's rom_addr output -- the arithmetic below is a pure relative
+// offset and does not change with the region base):
 //   0x00000: u3   (8 KB)  ← fixed bank, not reached by banked window
 //   0x02000-0x2FFFF: zero fill (184 KB gap — stored in SDRAM, reads return 0)
 //   0x30000: u4t  (64 KB) ← bank_reg 4 (low half), 5 (high half)
@@ -188,8 +194,9 @@ assign slave_halt_n = halt_n;
 // bank_reg 0-3 land in the zero-fill gap (0x10000-0x2FFFF) -- faithful
 // to MAME, since the real slave ROM region is unpopulated there too.
 //
-// Flat SDRAM layout: ROM stored verbatim at SDRAM offset 0x040000.
-// bank_base is the flat slave ROM byte address of the selected 32 KB bank.
+// rom_addr is a byte offset relative to the slave ROM region's own base
+// (added externally by sor_board.sv's sdram_rd1_addr); bank_base is that
+// relative offset of the selected 32 KB bank.
 //------------------------------------------------------------------
 reg [3:0] bank_reg;
 
@@ -288,76 +295,6 @@ always @(posedge clk_sys) begin
 	else if (bank_wr)
 		bank_reg <= cpu_dout[3:0]; // 0xC000 bank switch
 end
-
-assign dbg_bank_reg = bank_reg;
-
-//------------------------------------------------------------------
-// Debug: saturating count of accepted 0xC000 writes + max bank value
-// ever written (Follow-up 6 -- organic-bank-switch hardware evidence).
-// Edge-detected: the tv80 holds ~wr_n across two consecutive CE_6M
-// cycles per write machine cycle (the board TB's IOWR monitor logs
-// every write twice, 167ns apart, for the same reason), so counting
-// raw bank_wr cycles would tally ~2x per executed `ld ($C000),a`.
-// bank_wr_d1 remembers whether the PREVIOUS CE_6M cycle was already
-// this same write, so each write machine cycle counts exactly once.
-//------------------------------------------------------------------
-reg       bank_wr_d1;
-reg [7:0] bank_wr_cnt;
-reg [3:0] bank_max;
-always @(posedge clk_sys) begin
-	if (reset) begin
-		bank_wr_d1  <= 1'b0;
-		bank_wr_cnt <= 8'd0;
-		bank_max    <= 4'd0;
-	end else if (CE_6M) begin
-		bank_wr_d1 <= mem_access && ~wr_n && (cpu_addr == 16'hC000);
-		if (bank_wr && !bank_wr_d1) begin
-			if (bank_wr_cnt != 8'hFF) bank_wr_cnt <= bank_wr_cnt + 8'd1;
-			if (cpu_dout[3:0] > bank_max) bank_max <= cpu_dout[3:0];
-		end
-	end
-end
-assign dbg_bank_wr_cnt = bank_wr_cnt;
-assign dbg_bank_max    = bank_max;
-
-//------------------------------------------------------------------
-// Debug: PC latched at each opcode fetch (M1), same convention as
-// sor_master.sv's dbg_pc.
-//------------------------------------------------------------------
-reg [15:0] dbg_pc_r;
-always @(posedge clk_sys)
-	if (CE_6M && mem_access && ~m1_n) dbg_pc_r <= cpu_addr;
-assign dbg_pc = dbg_pc_r;
-
-//------------------------------------------------------------------
-// Debug: sticky flag -- a banked-window (0x4000-0xBFFF) ROM read cycle
-// actually completed (rom_read_cyc high and not stalled that cycle, so
-// rom_data was real, not a wait-state placeholder).
-//------------------------------------------------------------------
-reg dbg_banked_read_ever_r;
-always @(posedge clk_sys) begin
-	if (reset) dbg_banked_read_ever_r <= 1'b0;
-	else if (CE_6M && rom_read_cyc && in_banked && ~rom_stall) dbg_banked_read_ever_r <= 1'b1;
-end
-assign dbg_banked_read_ever = dbg_banked_read_ever_r;
-
-//------------------------------------------------------------------
-// Debug: rolling (wrapping, not saturating) count of accepted VRAM-port
-// write ops -- one increment per write op the sequencer actually
-// consumes, so rate is comparable across two screenshots taken seconds
-// apart (Task 1's MAME per-frame counter counts the same write events,
-// just at the CPU-write side rather than the drained-op side).
-// NOT CE_6M-gated: vp_pop is a one-clk_sys-cycle pulse from
-// sor_board's VRAM sequencer, which runs on raw clk_sys -- gating by
-// CE_6M (1-in-8 duty) would silently miss ~7/8 of the pops. vp_rd is
-// the popped op's type (q0_rd), valid in the vp_pop cycle.
-//------------------------------------------------------------------
-reg [15:0] vram_wr_cnt;
-always @(posedge clk_sys) begin
-	if (reset) vram_wr_cnt <= 16'd0;
-	else if (vp_pop && ~vp_rd) vram_wr_cnt <= vram_wr_cnt + 16'd1;
-end
-assign dbg_vram_wr_cnt = vram_wr_cnt;
 
 //------------------------------------------------------------------
 // CPU data input mux

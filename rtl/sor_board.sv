@@ -10,10 +10,16 @@
 //    - Inter-CPU latch ports
 //    - Sound CPU (Chunk 5 — real s80x86-based 80186 board, WP10)
 //
-//  SDRAM address layout (byte addresses):
-//    0x000000–0x03FFFF  Master Z80 program ROM  (256 KB, ioctl_index 0x00)
-//    0x040000–0x0BFFFF  Slave  Z80 program ROM  (512 KB flat, ioctl_index 0x01)
+//  SDRAM address layout (byte addresses, post-16-byte-header, see
+//  rtl/leland_board_pkg.sv for the canonical values):
+//    0x000000  Master Z80 program ROM (256 KB used of 1 MB reserved)
+//    0x100000  Slave  Z80 program ROM (~576 KB used of 2 MB reserved)
+//    0x300000  80186 sound ROM        (1 MB used, sparse)
+//    0x400000  bg_gfx tile ROM        (96 KB used of 2 MB reserved) -> BRAM
+//    0x600000  bg_prom palette PROM   (128 KB used of 256 KB reserved) -> BRAM
 //============================================================================
+
+import leland_board_pkg::*;
 
 module sor_board #(
 	// Passed straight through to the internal sdram controller. See
@@ -21,45 +27,6 @@ module sor_board #(
 	// required for real hardware; simulation testbenches override to 0
 	// to avoid needing Altera's vendor simulation libraries.
 	parameter bit USE_ALTDDIO = 1'b1,
-
-	// HARDWARE TIMING-CLOSURE EXPERIMENT (temporary): the on-screen
-	// diagnostic overlay's byte-test + full-ROM readback scanner issue
-	// real extra SDRAM read/write transactions purely for diagnostics,
-	// on top of the real ROM load and CPU traffic. Every RTL fix this
-	// session has verified correctly in a zero-delay behavioral
-	// simulator and produced no change on real hardware -- the
-	// signature of a timing-closure problem invisible to sim, not a
-	// logic bug. SuperOffRoad.sdc false-paths the entire SDRAM
-	// interface (including SDRAM_DQ), so Quartus never checks real
-	// setup/hold there either. Set to 0 to stop the diagnostic
-	// scanner from ever issuing a request at all (rd_phase stays
-	// parked in RD_IDLE permanently), removing that extra SDRAM bus
-	// load/switching activity, as a test of whether reduced load
-	// changes real hardware boot behavior. Set back to 1 to resume
-	// normal diagnostics once this experiment is answered.
-	// Diagnostic job (the byte-test/full-scan investigation) was done
-	// and this was disabled, but docs/sdram_plan.md B1 (Section 2) re-
-	// enables it: the new live fetch-mismatch counter (RD_LIVE_IDLE/
-	// REQ/WAIT below) is chained after rd_scan_done, which only fires
-	// through this same byte-test+scan chain. Flip back to 0 once B1's
-	// diagnostic build cycle is over and the overlay should stop
-	// obstructing gameplay again.
-	parameter bit ENABLE_SDRAM_DIAG_TRAFFIC = 1'b1,
-
-	// Granular A/B switch: the two diagnostic reads that run in the
-	// MIDDLE of the ROM download (the "immediate" read of address 0
-	// right after its own write ack, and the "early" read at the
-	// master->slave index transition). These are the only diagnostic
-	// operations interleaved with the live write stream -- the
-	// byte-test and the full scan both run strictly after loading
-	// finishes and cannot perturb it. Sim shows the immediate read
-	// returning the correct 0xF3 while real hardware returns 0x00 for
-	// the identical sequence, and the earlier "all diagnostics off,
-	// still broken" exoneration is invalid (it ran on top of the
-	// broken-MRA load, which guaranteed failure regardless). 0 = keep
-	// the overlay and post-load diagnostics but inject nothing into
-	// the download window.
-	parameter bit ENABLE_MIDLOAD_DIAG_READS = 1'b0,
 
 	// How long ioctl_download must stay LOW before the load is
 	// considered genuinely finished (250ms at 48MHz by default; sim
@@ -77,7 +44,10 @@ module sor_board #(
 )
 (
 	input         clk_sys,   // 48 MHz
-	input         clk_sdram, // phase-shifted 48 MHz PLL output, drives SDRAM_CLK (docs/sdram_plan.md Section 3a)
+	input         clk_sdram, // phase-shifted 48 MHz PLL output, drives SDRAM_CLK
+	                          // (docs/sdram_plan.md Section 3a; WP-L3's dedicated
+	                          // 96MHz clock/CDC bridge was reverted 2026-07-22 --
+	                          // see rtl/pll/pll_0002.v's outclk_1 comment)
 	input         reset,      // CPU/game reset (includes ioctl_download)
 	input         sdram_init, // SDRAM hardware reset only (~pll_locked | RESET)
 
@@ -123,9 +93,22 @@ module sor_board #(
 	// IPT_PEDAL AN0/AN1/AN2 exactly -- read directly, no encoding.
 	input   [7:0] p1_pedal, p2_pedal, p3_pedal,
 
+	// WP-L3: 4-player digital joystick, used only when the active game's
+	// input_scheme is JOY4_DIGITAL (pigout) -- unconsumed for WHEELS3_
+	// PEDALS3 games. Bit layout: [0]=right [1]=left [2]=down [3]=up
+	// [4]=btn1 [5]=btn2 [6]=start [7]=coin (standard MiSTer joystick
+	// vector convention).
+	input   [7:0] p1_joy, p2_joy, p3_joy, p4_joy,
+
 	// OSD options
 	input         service,
 	input         free_play,
+
+	// Debug overlay toggle (2026-07-25, Pig Out slow-motion investigation
+	// instrumentation): OSD-controlled on-screen hex counters, see
+	// sor_video.sv's overlay render block. Purely display; touches no
+	// game logic.
+	input         show_overlay,
 
 	// Audio (WP10: leland_dac_mixer's mono output, via sor_sound)
 	output signed [15:0] audio_out
@@ -209,6 +192,32 @@ wire [24:0] sdram_wr_addr;
 wire  [7:0] sdram_wr_data;
 wire  [7:0] sdram_wr_data_hi;
 
+// Read port 2 (WP-L2: sor_video's background-tilemap gfx/prom fetch --
+// reuses the rd2 channel slot/naming freed by WP-L0's removal of the
+// old diagnostic byte-test scanner; unrelated new use). Highest read
+// priority (second only to writes) per docs/planning_leland_multiboard.md
+// section 5 -- the video fetch FSM has a tight, timing-critical
+// arm-to-commit deadline (LEAD=8 pixel-clock ticks, see sor_video.sv),
+// while master/slave/sound CPU reads are comparatively forgiving via
+// their own stall mechanisms.
+// sdram_rd2_req/addr feed the arbiter and are muxed (below, near the
+// gfx-repack FSM) between sor_video's own request (sdram_rd2_req_v/addr_v)
+// and the one-shot boot-time repack FSM's -- the two are mutually
+// exclusive in time (repack always finishes, gated via repack_done into
+// video_release, before sor_video's reset ever releases and it can start
+// requesting) so there's no real arbitration needed between them, just a
+// simple mux.
+wire        sdram_rd2_req;
+wire [24:0] sdram_rd2_addr;
+wire        sdram_rd2_req_v;
+wire [24:0] sdram_rd2_addr_v;
+reg         sdram_rd2_ack;
+reg   [7:0] sdram_rd2_data;
+reg  [15:0] sdram_rd2_data16; // wider-reads path, see sor_video.sv's FP_GFXROW_REQ/WAIT
+reg  [15:0] sdram_rd2_data16_hi; // WP-M8: second burst word (BURST_LEN=2) of the same GFXROW read
+wire        rd2_fetch_busy; // whole-tile-burst-in-progress, see sor_video.sv's fetch_busy comment
+wire  [3:0] rd2_rbuf_count; // ring-buffer occupancy, see sor_video.sv's rbuf_count_out comment
+
 // Read port 0 (master Z80)
 wire        sdram_rd0_req;
 reg         sdram_rd0_ack;
@@ -231,12 +240,6 @@ wire        sdram_rd3_req;
 reg         sdram_rd3_ack;
 wire [24:0] sdram_rd3_addr;
 reg   [7:0] sdram_rd3_data;
-
-// Read port 2 (diagnostic readback scanner)
-reg         sdram_rd2_req;
-reg         sdram_rd2_ack;
-reg  [24:0] sdram_rd2_addr;
-reg   [7:0] sdram_rd2_data;
 
 // SDRAM chip-side signals (16-bit DQ, matches the physical SDRAM_DQ pin)
 wire        sd_cke, sd_cs_n, sd_ras_n, sd_cas_n, sd_we_n;
@@ -264,13 +267,62 @@ assign {SDRAM_DQMH, SDRAM_DQML} = sd_dqm;
 // away or renamed, regardless of how Quartus flattens hierarchy.
 (* keep *) wire        sd_ready;
 (* keep *) wire        sd_req_done;
+(* keep *) wire        sd_req_hit;
 (* keep *) wire  [7:0] sd_dout;
+(* keep *) wire [15:0] sd_dout16; // full captured word, see sdram.sv's dout16
+// WP-M8 (2026-07-24): burst-safe views of the above -- see sdram_banked.sv's
+// dout_b0/burst_words port comments. sd_dout_b0/sd_burst_words are what the
+// arbiter chokepoint below actually latches into each channel's data
+// register now (not sd_dout/sd_dout16), so raising BURST_LEN later can't
+// silently corrupt a client that never migrated off the legacy path.
+(* keep *) wire  [7:0] sd_dout_b0;
+(* keep *) wire [7:0][15:0] sd_burst_words;
 
-localparam CH_WR = 3'd0, CH_RD0 = 3'd1, CH_RD1 = 3'd2, CH_RD3 = 3'd3, CH_RD2 = 3'd4;
+localparam CH_WR = 3'd0, CH_RD2 = 3'd1, CH_RD0 = 3'd2, CH_RD1 = 3'd3, CH_RD3 = 3'd4;
 
-// Fixed priority: wr > rd0 > rd1 > rd3(sound) > rd2(diagnostic), gated
-// by !in_flight. rd3 (WP10) inserted between rd1 and rd2 -- diagnostic
-// keeps its already-lowest priority.
+// Priority: wr always on top; among the reads, rd2(video) is normally at
+// the BOTTOM (below rd0/rd1/rd3) but AGES to the TOP of the read group
+// (above rd0/rd1/rd3, never above wr) once its pending request has
+// waited too long -- see the rd2_age_cnt/rd2_boost block further down
+// (right before the sel_wr/sel_rd* wires) for the full aging scheme and
+// its threshold arithmetic. Gated by !in_flight throughout.
+//
+// WP-L2 POST-HARDWARE-BRINGUP REVISION (2026-07-20): the plan doc's
+// original order (wr > rd2 > rd0 > rd1 > rd3, video given top read
+// priority for its LEAD=8 deadline) measured out on real hardware as a
+// severe master/slave slowdown and sound dropouts, even though sim's
+// pixel-diff regression stayed clean (sim only checks gfx correctness,
+// never CPU timing headroom). Root cause, computed from this file's own
+// fetch FSM (sor_video.sv fetch_ph): each background tile fetch is 4
+// sequential SDRAM req/ack round trips (prom + 3 gfx planes), held
+// nearly back-to-back (only a single idle cycle between each) -- ~20-25
+// clk_sys cycles of near-continuous sdram_rd2_req assertion per tile.
+// The fetch arm (col_in_tile==0) fires every 8 hc-ticks across the
+// ENTIRE raster, blanking included (H_TOTAL=424 x V_TOTAL=256 = 13568
+// tile-fetches/frame, vs only 320/8 x 240 = 9600 actually needed for the
+// visible 320x240 area -- roughly 1.4x more fetches than necessary, but
+// that overshoot is NOT the dominant term). At ~727,700 clk_sys cycles/
+// frame (48MHz / 65.95Hz refresh) and 13568 fetches x ~22 cycles busy
+// each, rd2 is asserted roughly 298,000/727,700 = ~41% OF EVERY FRAME'S
+// CYCLES. Because rd2 sat above rd0/rd1/rd3, any CPU/sound request
+// landing in that ~41% window had to wait out the remainder of rd2's
+// current 4-transaction burst (worst case ~20-25 cycles) before being
+// granted -- compare to master/slave Z80s only getting one memory-cycle
+// opportunity per CE_6M tick (every 8 clk_sys cycles) and sound's 80186
+// one per CE_8M tick (every 6): a ~20-25 cycle stall on ~41% of accesses
+// is a multi-times inflation of effective memory latency, consistent
+// with the observed slowdown/audio dropouts. Pre-WP-L2, rd0 (master) sat
+// at the top of the read priority chain with zero read-side contention
+// at all.
+//
+// Fix: put video (rd2) at the BOTTOM of the read priority chain instead
+// of the top. sor_video.sv's own LEAD=8 arm-to-commit window (~54
+// clk_sys cycles) already budgets ~2x margin over the ~20-25 cycles a
+// fetch needs even WITHOUT any priority advantage, specifically so it
+// could tolerate exactly this kind of reordering; master/slave/sound
+// have no equivalent slack in this design and must not be made to wait
+// behind the highest-duty-cycle channel on the bus. rd3 (sound) placed
+// above rd2 too, for the same reason its ROM reads were also starving.
 //
 // THE DUPLICATE-TRANSACTION RACE this gate closes (root cause of the
 // hardware read-back corruption): sdram_simple is LEVEL-sensitive --
@@ -300,17 +352,229 @@ localparam CH_WR = 3'd0, CH_RD0 = 3'd1, CH_RD1 = 3'd2, CH_RD3 = 3'd3, CH_RD2 = 3
 (* keep *) reg        done_seen;   // its req_done has fired (completion latched)
 (* keep *) reg  [2:0] issued_ch;
 
-wire sel_wr  = !in_flight && sdram_wr_req;
-wire sel_rd0 = !in_flight && !sel_wr && sdram_rd0_req;
-wire sel_rd1 = !in_flight && !sel_wr && !sel_rd0 && sdram_rd1_req;
-wire sel_rd3 = !in_flight && !sel_wr && !sel_rd0 && !sel_rd1 && sdram_rd3_req;
-wire sel_rd2 = !in_flight && !sel_wr && !sel_rd0 && !sel_rd1 && !sel_rd3 && sdram_rd2_req;
+//------------------------------------------------------------------
+// rd2 (video) AGING / PRIORITY-BOOST (2026-07-20, post-attempt-2 hardware
+// bringup): neither static ordering worked. rd2-on-top (original plan doc
+// order) starved master/slave/sound -- see the big comment above this
+// block. rd2-on-bottom (the fix applied there) went the other way: on
+// real hardware it produced visible horizontal tearing/near-loss-of-sync,
+// because under genuine CPU/sound bus load rd2's own request can now sit
+// pending long enough to blow its LEAD=8 arm-to-commit deadline (~54
+// clk_sys cycles, see sor_video.sv) -- fixed-bottom priority provides NO
+// bound on worst-case wait when rd0/rd1/rd3 are busy enough of the time.
+//
+// Fix: age rd2's pending request. It starts each pending request at the
+// BOTTOM of the read chain (preserving attempt-2's normal-case win for
+// CPU/sound), and only jumps to the TOP (attempt-1's position, matching
+// wr > rd2 > rd0 > rd1 > rd3) once it has been waiting long enough that
+// missing the deadline becomes a real risk. This bounds worst-case rd2
+// latency (aging forces top-priority within a fixed number of cycles)
+// while keeping average-case CPU/sound interference low (a boost only
+// fires when video is actually at risk, not on every fetch).
+//
+// Threshold arithmetic: LEAD=8 gives a full tile-fetch (arm to commit)
+// ~54 clk_sys cycles (per sor_video.sv's own LEAD=8 comment). A tile
+// fetch is 4 sequential req/ack round trips (prom + 3 gfx planes); the
+// prior attempt's own measurement put the whole burst at ~20-25 cycles
+// when it runs back-to-back with no contention, i.e. ~5-6 clk_sys cycles
+// per sub-request on average (sdram_simple's CAS_LAT=3 read latency plus
+// the FSM's one idle cycle between phases). We age the *whole pending
+// tile-fetch sequence* with a single counter (simplest correct choice --
+// per-sub-request separate counters would only matter if we wanted a
+// tighter bound, which isn't needed here): it starts counting from the
+// first cycle sdram_rd2_req is asserted-but-ungranted after a fetch_ph
+// phase change, and is cleared on every rd2 grant (each sub-request ack)
+// so it always reflects "how long has the CURRENT sub-request been
+// waiting", not cumulative wait across the whole tile.
+//
+// Chosen threshold: 24 clk_sys cycles. Reasoning:
+//   - 24 is comfortably above the ~5-6 cycles a sub-request needs when
+//     granted immediately (so under light/no contention the boost never
+//     fires at all -- zero steady-state interference with CPU/sound,
+//     identical behavior to attempt 2 in the common case).
+//   - 24 leaves 54 - 24 = 30 cycles of remaining budget after the boost
+//     fires. Once boosted, rd2 sits at the TOP of the read chain, so the
+//     very next arbitration slot after the in-flight transaction (if any)
+//     drains is rd2's -- worst case one already-in-flight transaction
+//     (bounded by sdram_simple's own fixed CAS_LAT=3 protocol, a handful
+//     of cycles) plus this sub-request's own ~5-6 cycles, then any
+//     REMAINING sub-requests in the tile (up to 3 more at ~5-6 cycles
+//     each = ~18) still comfortably fit inside 30. Even the pessimistic
+//     case -- boost fires on the FIRST sub-request of the tile, at cycle
+//     24, and all 4 sub-requests had to each independently re-age and
+//     re-boost -- keeps every individual wait capped at 24, i.e. total
+//     worst case bounded near 4*24=96 only if boosting somehow failed to
+//     win priority each time, which it cannot: once boosted, rd2 is
+//     top-priority and wins the very next free slot, so in practice the
+//     worst realistic case is one 24-cycle wait (first sub-request boosts)
+//     followed by the remaining sub-requests each granted promptly because
+//     rd2 stays boosted (aged) as long as ANY sub-request of the current
+//     tile is still pending -- see rd2_boost latch behavior below.
+//   - 24 was chosen over a lower value (e.g. 16) to keep meaningful
+//     average-case margin before boosting -- boosting too eagerly would
+//     approach attempt 1's always-high-priority behavior and reintroduce
+//     its CPU/sound interference. 24 was chosen over a higher value
+//     (e.g. 36-40) because that would leave too little slack (< 20
+//     cycles) to guarantee the remaining sub-requests and any single
+//     already-in-flight transaction complete before the ~54-cycle wall.
+//------------------------------------------------------------------
+// ROUND-ROBIN READ ARBITRATION (2026-07-22, replaces the fixed-priority-
+// with-single-aging-exception scheme above): real hardware testing
+// after the wider-reads/tile-cache follow-up showed rd3 (the 80186
+// sound CPU's own ROM-fetch channel) starving hardest of all four read
+// channels under real gameplay load -- confirmed via a dedicated
+// per-channel latency diagnostic overlay (rd0/rd1/rd3_txn_max, see
+// their declarations below): rd3 went RED (>=80 cycles) the moment the
+// race started while rd0/rd1/rd2 stayed green/yellow. Root cause: rd3
+// sat at the ABSOLUTE BOTTOM of a fixed priority chain with zero
+// protection at all, while rd2 alone had a bespoke aging/boost escape
+// hatch (the RD2_AGE_THRESH scheme this replaces). Bolting a THIRD
+// bespoke aging counter onto rd3 (after rd2's) would be whack-a-mole --
+// generalizing to genuine round-robin fairness across all 4 read
+// channels fixes this class of problem for good, and is exactly what
+// Darius_MiSTer's tile_rom_arbiter.sv does (referenced during the
+// original sanity-check investigation but not adopted until now). wr
+// keeps absolute top priority throughout, unchanged -- ioctl-load
+// correctness depends on writes never being delayed, and writes aren't
+// part of the starvation problem (nothing else waits behind rd3-class
+// starvation there).
+//
+// rr_last holds the channel granted last time; the next grant scans
+// starting from rr_last+1 and wraps, so whichever channel just went
+// checks last next time -- no channel can be skipped for more than 3
+// consecutive read grants no matter how busy the others are, a hard
+// worst-case bound fixed-priority-with-exceptions can't offer.
+localparam RR_RD0 = 2'd0, RR_RD1 = 2'd1, RR_RD2 = 2'd2, RR_RD3 = 2'd3;
+reg [1:0] rr_last;
 
-(* keep *) wire [24:0] sd_addr = sel_wr  ? sdram_wr_addr  :
-                       sel_rd0 ? sdram_rd0_addr :
-                       sel_rd1 ? sdram_rd1_addr :
-                       sel_rd3 ? sdram_rd3_addr :
-                                 sdram_rd2_addr;
+wire [3:0] rr_req = {sdram_rd3_req, sdram_rd2_req, sdram_rd1_req, sdram_rd0_req}; // bit N = channel N's req
+
+function automatic [1:0] rr_pick(input [3:0] req, input [1:0] last);
+	reg [1:0] c1, c2, c3;
+	begin
+		c1 = last + 2'd1;
+		c2 = last + 2'd2;
+		c3 = last + 2'd3;
+		if      (req[c1]) rr_pick = c1;
+		else if (req[c2]) rr_pick = c2;
+		else if (req[c3]) rr_pick = c3;
+		else if (req[last]) rr_pick = last;
+		else rr_pick = last; // no request pending at all -- don't-care, sel_* below all read 0
+	end
+endfunction
+
+// URGENCY ESCALATION -- rd2 ONLY (2026-07-22, narrowed same-day after a
+// second hardware round): the first attempt at this made ALL FOUR
+// channels urgency-escalating and made things WORSE overall (all four
+// latency boxes went from green to yellow, audio noticeably worse) --
+// symmetric urgency across every channel means frequent preemptions,
+// and each preemption pushes whichever channels it delayed closer to
+// THEIR OWN threshold too, cascading into more total contention than
+// plain round-robin had, not less. The actual evidence only ever showed
+// ONE channel with a real problem: rd2 at boot (stale-commit box red,
+// recovering to green once the initial burst settled). Plain round-
+// robin alone already fixed rd3 (the original starvation target) with
+// no reported issue -- rd0/rd1/rd3 never needed an escape hatch, only
+// rd2 did, so only rd2 gets one. This is back to "round-robin baseline
+// + one bounded anti-starvation exception," same shape as the original
+// rd2-only aging scheme this whole arbiter section replaced, just
+// riding on round-robin (fair to rd0/rd1/rd3) instead of fixed priority
+// (which is what actually starved rd3 in the first place) as the
+// non-urgent baseline.
+//
+// rd2_wait_cnt uses rd2_fetch_busy (whole-tile-burst-in-progress), not
+// a plain req&&!ack pending check, for the same reason the original
+// rd2-only aging fix needed it: sor_video.sv's fetch FSM drops its req
+// line for exactly one cycle between each tile's 3-4 sub-requests, so a
+// plain pending check would silently reset urgency at every sub-request
+// boundary instead of tracking the whole burst -- the bug this
+// session's earlier fix (see the BUGFIX comment history in this file)
+// already found and fixed once for the old scheme; carried forward
+// here rather than reintroduced.
+//
+// ROOT-CAUSE FIX (2026-07-22, same-day third round): rd2-only urgency
+// as first written (wait-time alone) still moved rd0/rd1/rd3 from green
+// to yellow simultaneously -- not the cascading-preemption failure mode
+// symmetric urgency had, but a milder version of the same class of
+// problem. Root cause, confirmed by reading sor_video.sv's fetch FSM
+// directly: the producer re-arms a new fetch every single clk_sys cycle
+// it has ANY room in its 8-deep ring buffer (`fetch_ph==FP_IDLE &&
+// rbuf_has_room`), so rd2_fetch_busy -- and therefore rd2_wait_cnt -- is
+// true almost continuously regardless of how full the buffer actually
+// is. That means rd2_urgent was tripping on ordinary, harmless refill
+// bursts just as often as on genuine near-underrun risk, stealing far
+// more round-robin slots from rd0/rd1/rd3 than actually necessary.
+//
+// Fix: gate urgency on ring-buffer occupancy (rbuf_count, exposed from
+// sor_video.sv as rbuf_count_out/rd2_rbuf_count here) IN ADDITION TO
+// the existing wait-time check, not wait-time alone. rd2 now only
+// preempts round-robin when it has ALSO waited past URGENT_THRESH AND
+// the buffer has fallen to RD2_LOW_WATER or fewer of its 8 slots --
+// i.e. only when it's both been waiting a while AND is genuinely close
+// to running dry, not merely "busy doing its normal thing." A full
+// buffer rides plain round-robin like everyone else, handing those
+// slots back to rd0/rd1/rd3. Boot-time behavior is preserved (buffer
+// starts fully empty, so urgency still fires essentially immediately,
+// same as before) and rd3 is untouched (still plain round-robin
+// throughout, so its earlier fix isn't at risk).
+localparam URGENT_THRESH   = 8'd32;
+// Tightened from 2 to 1 (2026-07-22, same-day fourth round): with
+// LOW_WATER=2, real sustained gameplay load (not just boot) still
+// dropped rd0/rd1/rd3 to yellow during the actual race, and a visible
+// gameplay symptom (a HUD/score update lagging ~1-2s behind a nitro
+// pickup) pointed at real CPU-instruction-fetch throughput loss, not a
+// stuck write (the HUD write itself is direct dual-port BRAM, never
+// SDRAM-arbitrated -- the lag is consistent with rd0/rd1 fetch latency
+// slowing the CPUs' own execution, not a delayed write). rd2's own
+// latency box has been solidly green with real margin at LOW_WATER=2,
+// suggesting escalation was still firing earlier than strictly
+// necessary -- letting the buffer run one slot closer to empty before
+// contesting for the bus should further cut how often rd2 takes a slot
+// from rd0/rd1/rd3, without giving up real underrun protection (buffer
+// depth is 8; even LOW_WATER=1 still escalates with room to spare
+// before an actual empty-buffer stall).
+localparam RD2_LOW_WATER   = 4'd1; // buffer depth is 8 (RBUF_N in sor_video.sv); escalate only at <=1 of 8
+
+reg [7:0] rd2_wait_cnt;
+always @(posedge clk_sys) begin
+	if (sdram_init) rd2_wait_cnt <= 8'd0;
+	else rd2_wait_cnt <= rd2_fetch_busy ? ((rd2_wait_cnt == 8'hFF) ? rd2_wait_cnt : rd2_wait_cnt + 8'd1) : 8'd0;
+end
+
+wire       rd2_urgent  = sdram_rd2_req && (rd2_wait_cnt >= URGENT_THRESH) && (rd2_rbuf_count <= RD2_LOW_WATER);
+wire [1:0] rr_grant_ch = rd2_urgent ? RR_RD2 : rr_pick(rr_req, rr_last);
+
+wire sel_wr  = !in_flight && sdram_wr_req;
+wire sel_rd0 = !in_flight && !sel_wr && sdram_rd0_req && (rr_grant_ch == RR_RD0);
+wire sel_rd1 = !in_flight && !sel_wr && sdram_rd1_req && (rr_grant_ch == RR_RD1);
+wire sel_rd2 = !in_flight && !sel_wr && sdram_rd2_req && (rr_grant_ch == RR_RD2);
+wire sel_rd3 = !in_flight && !sel_wr && sdram_rd3_req && (rr_grant_ch == RR_RD3);
+
+// WP-M (open-row multichannel): each client is pinned to one SDRAM bank
+// (see leland_board_pkg::sdram_addr_to_bank / sdram_bank_base for the map).
+// sd_addr_rel is the region-relative byte offset within the client's bank;
+// sd_bank is the 2-bit physical bank index. Together they replace the old
+// 25-bit absolute sd_addr that encoded bank in bits [11:10] of the address.
+//
+// Per-client bank assignment (fixed, matching planning_sdram_multichannel.md §2):
+//   rd0 (master Z80)  → bank 0   base ADDR_MASTER_BASE (0x000000)
+//   rd1 (slave  Z80)  → bank 1   base ADDR_SLAVE_BASE  (0x100000)
+//   rd3 (80186 sound) → bank 2   base ADDR_SOUND_BASE  (0x300000)
+//   rd2 (video gfx)   → bank 3   base ADDR_GFX_BASE    (0x400000)
+//   wr  (ioctl+repack) → decoded from sdram_wr_addr via package functions
+wire [1:0]  wr_bank    = sdram_addr_to_bank({2'b0, sdram_wr_addr});
+wire [22:0] wr_rel     = sdram_wr_addr[22:0] - sdram_bank_base({2'b0, sdram_wr_addr});
+
+(* keep *) wire  [1:0] sd_bank     = sel_wr  ? wr_bank :
+                                      sel_rd0 ? 2'd0 :
+                                      sel_rd1 ? 2'd1 :
+                                      sel_rd3 ? 2'd2 :
+                                                2'd3;   // sel_rd2
+(* keep *) wire [22:0] sd_addr_rel = sel_wr  ? wr_rel :
+                       sel_rd0 ? sdram_rd0_addr[22:0] :                           // MASTER_BASE=0
+                       sel_rd1 ? (sdram_rd1_addr[22:0] - ADDR_SLAVE_BASE[22:0]) :
+                       sel_rd2 ? (sdram_rd2_addr[22:0] - ADDR_GFX_BASE[22:0])   :
+                                 (sdram_rd3_addr[22:0] - ADDR_SOUND_BASE[22:0]);
 (* keep *) wire  [7:0] sd_din    = sdram_wr_data;
 (* keep *) wire  [7:0] sd_din_hi = sdram_wr_data_hi;
 // Every write is now a full-word write (see sdram_wr_data_hi comment
@@ -319,28 +583,29 @@ wire sel_rd2 = !in_flight && !sel_wr && !sel_rd0 && !sel_rd1 && !sel_rd3 && sdra
 // unused here.
 (* keep *) wire        sd_we      = 1'b0;
 (* keep *) wire        sd_we_word = sel_wr;
-(* keep *) wire        sd_rd      = sel_rd0 | sel_rd1 | sel_rd3 | sel_rd2;
+(* keep *) wire        sd_rd      = sel_rd2 | sel_rd0 | sel_rd1 | sel_rd3;
 
 // Level of the granted channel's own req line -- in_flight releases
 // only once this drops, guaranteeing the controller never re-sees a
 // request whose ack is still propagating back to its client.
 wire issued_req_level = (issued_ch == CH_WR)  ? sdram_wr_req  :
+                        (issued_ch == CH_RD2) ? sdram_rd2_req :
                         (issued_ch == CH_RD0) ? sdram_rd0_req :
                         (issued_ch == CH_RD1) ? sdram_rd1_req :
-                        (issued_ch == CH_RD3) ? sdram_rd3_req :
-                                                sdram_rd2_req;
+                                                sdram_rd3_req;
 
 always @(posedge clk_sys) begin
 	sdram_wr_ack  <= 1'b0;
+	sdram_rd2_ack <= 1'b0;
 	sdram_rd0_ack <= 1'b0;
 	sdram_rd1_ack <= 1'b0;
 	sdram_rd3_ack <= 1'b0;
-	sdram_rd2_ack <= 1'b0;
 
 	if (sdram_init) begin
 		sdram_ready <= 1'b0;
 		in_flight   <= 1'b0;
 		done_seen   <= 1'b0;
+		rr_last     <= RR_RD0;
 	end else begin
 		// Sticky "init genuinely completed" -- sd_ready itself toggles
 		// low/high per-transaction after init, but CPU reset gating,
@@ -355,9 +620,14 @@ always @(posedge clk_sys) begin
 		// issued_ch can never be overwritten mid-flight by a higher-
 		// priority channel raising its req.
 		if (sd_ready && (sd_rd || sd_we_word)) begin
-			issued_ch <= sel_wr ? CH_WR : sel_rd0 ? CH_RD0 : sel_rd1 ? CH_RD1 : sel_rd3 ? CH_RD3 : CH_RD2;
+			issued_ch <= sel_wr ? CH_WR : sel_rd2 ? CH_RD2 : sel_rd0 ? CH_RD0 : sel_rd1 ? CH_RD1 : CH_RD3;
 			in_flight <= 1'b1;
 			done_seen <= 1'b0;
+			// Round-robin pointer: only reads rotate it (a write grant
+			// doesn't consume a "turn" among the read channels, so the
+			// next read arbitration still starts from wherever it left
+			// off before the write interrupted).
+			if (!sel_wr) rr_last <= rr_grant_ch;
 		end
 
 		// Completion -- sd_req_done unambiguously distinguishes a real
@@ -369,10 +639,10 @@ always @(posedge clk_sys) begin
 			done_seen <= 1'b1;
 			case (issued_ch)
 				CH_WR:  sdram_wr_ack  <= 1'b1;
-				CH_RD0: begin sdram_rd0_data <= sd_dout; sdram_rd0_ack <= 1'b1; end
-				CH_RD1: begin sdram_rd1_data <= sd_dout; sdram_rd1_ack <= 1'b1; end
-				CH_RD3: begin sdram_rd3_data <= sd_dout; sdram_rd3_ack <= 1'b1; end
-				CH_RD2: begin sdram_rd2_data <= sd_dout; sdram_rd2_ack <= 1'b1; end
+	CH_RD2: begin sdram_rd2_data <= sd_dout_b0; sdram_rd2_data16 <= sd_burst_words[0]; sdram_rd2_data16_hi <= sd_burst_words[1]; sdram_rd2_ack <= 1'b1; end
+				CH_RD0: begin sdram_rd0_data <= sd_dout_b0; sdram_rd0_ack <= 1'b1; end
+				CH_RD1: begin sdram_rd1_data <= sd_dout_b0; sdram_rd1_ack <= 1'b1; end
+				CH_RD3: begin sdram_rd3_data <= sd_dout_b0; sdram_rd3_ack <= 1'b1; end
 			endcase
 		end
 
@@ -386,24 +656,40 @@ always @(posedge clk_sys) begin
 	end
 end
 
-sdram_simple #(
+// WP-L3's dedicated 96MHz clock domain + async CDC bridge (sdram_cdc_bridge)
+// was reverted 2026-07-22 (net-negative for SDRAM bus bandwidth -- see
+// rtl/pll/pll_0002.v's outclk_1 comment) -- sdram_simple runs directly on
+// clk_sys again, exactly as before WP-L3.
+//
+// CAS_LAT=3: matches Darius's real, deployed, hardware-proven value.
+// (The reference file's own default of 2 -- and briefly, widening
+// TRCD_NS -- were both tried and ruled out as fixes for the 'zz'
+// read-back symptom seen in sim; the real cause was an off-by-one
+// in the module's own read-capture scheduling, fixed directly in
+// rtl/sdram.sv rather than by tuning timing parameters here. CAS_LAT
+// itself is left at this conservative, widely-supported value
+// rather than tuned further against any one simulator or physical
+// module.)
+// WP-M: sdram_banked replaces sdram_simple. Open-row/multi-bank controller;
+// bank_sel pins each client to its own physical bank so cross-client
+// interleaving no longer thrashes open rows. Physical layer (init, read
+// capture, DQM/word-write, registered outputs) preserved verbatim.
+// Rollback: revert to sdram_simple instantiation and remove sd_bank/sd_addr_rel.
+// WP-M8 (2026-07-24): BURST_LEN raised from its WP-M6 default of 1 to 2 --
+// this is a SHARED instance, so every read on every channel (rd0/rd1/rd3/
+// rd2's own PROM byte fetch) now captures 2 words per transaction, not
+// just rd2's new GFXROW fetch. This is safe for all of them because of
+// the WP-M8 step-1 dout_b0/burst_words[0] migration (see that port's
+// comment in rtl/sdram_banked.sv): every single-word caller already reads
+// via sd_dout_b0/sd_burst_words[0], which stays correct regardless of
+// BURST_LEN. The extra word capture costs those callers a small amount of
+// unused latency (READ_WAIT_LOAD grows by BURST_LEN-1 cycles) but no
+// correctness risk. Only rd2's GFXROW fetch (rtl/sor_video.sv's
+// FP_GFXROW_REQ/WAIT) actually uses the second word (sd_burst_words[1]).
+sdram_banked #(
 	.CLK_MHZ(48),
-	// CAS_LAT=3: matches Darius's real, deployed, hardware-proven value.
-	// (The reference file's own default of 2 -- and briefly, widening
-	// TRCD_NS -- were both tried and ruled out as fixes for the 'zz'
-	// read-back symptom seen in sim; the real cause was an off-by-one
-	// in the module's own read-capture scheduling, fixed directly in
-	// rtl/sdram.sv rather than by tuning timing parameters here. CAS_LAT
-	// itself is left at this conservative, widely-supported value
-	// rather than tuned further against any one simulator or physical
-	// module.)
-	.CAS_LAT(3)
-	// READ_CAP_EXTRA left at module default (0) for B5 (docs/sdram_plan.md
-	// Section 3a/4 Step 3): 90-deg SDRAM_CLK phase (pll_0002.v
-	// phase_shift1) with capture back at the original T4 point --
-	// Section 1.2 predicts +3.5/+14 ns here without needing the capture
-	// stretch B2-B4 used. (B2-B4 used READ_CAP_EXTRA=1; see git history /
-	// docs/SDRAM_TIMING_INVESTIGATION.md if reviving that combination.)
+	.CAS_LAT(3),
+	.BURST_LEN(2)
 ) sdram_ctrl
 (
 	.sd_cke   (sd_cke),
@@ -418,17 +704,22 @@ sdram_simple #(
 	.sd_dq_oe (sd_dq_oe),
 	.sd_dq_in (sd_dq_in),
 
-	.clk     (clk_sys),
-	.rst_n   (~sdram_init),
-	.addr    (sd_addr),
-	.din     (sd_din),
-	.dout    (sd_dout),
-	.rd      (sd_rd),
-	.we      (sd_we),
-	.din_hi  (sd_din_hi),
-	.we_word (sd_we_word),
-	.ready   (sd_ready),
-	.req_done(sd_req_done)
+	.clk      (clk_sys),
+	.rst_n    (~sdram_init),
+	.addr     (sd_addr_rel),
+	.bank_sel (sd_bank),
+	.din      (sd_din),
+	.dout     (sd_dout),
+	.dout16   (sd_dout16),
+	.rd       (sd_rd),
+	.we       (1'b0),
+	.din_hi   (sd_din_hi),
+	.we_word  (sd_we_word),
+	.ready    (sd_ready),
+	.req_done (sd_req_done),
+	.req_hit  (sd_req_hit),
+	.burst_words(sd_burst_words),
+	.dout_b0    (sd_dout_b0)
 );
 
 //------------------------------------------------------------------
@@ -442,6 +733,7 @@ sdram_simple #(
 // inverted-clk_sys/180-deg-via-DDIO trick): ALL phase now comes from the
 // PLL's second output (clk_sdram); the DDIO stays in the IOE purely for
 // low-skew forwarding, non-inverting (datain_h=1, datain_l=0).
+//
 //------------------------------------------------------------------
 generate
 	if (USE_ALTDDIO) begin : g_ddr_clk
@@ -474,8 +766,10 @@ endgenerate
 //------------------------------------------------------------------
 // ioctl → SDRAM write
 //
-//   ioctl_index 0x00: master ROM, flat 256 KB, SDRAM 0x000000+
-//   ioctl_index 0x01: slave  ROM, flat 512 KB, SDRAM 0x040000+
+// Single index="0" session (post-16-byte-header, see leland_board_pkg):
+//   master ROM: ADDR_MASTER_BASE+, 256 KB used
+//   slave  ROM: ADDR_SLAVE_BASE+,  ~576 KB used
+//   sound  ROM: ADDR_SOUND_BASE+,  1 MB used (sparse)
 //
 // ioctl_wait stays high from wr_req until wr_ack, holding off the
 // HPS downloader.  We also stall during SDRAM init (sdram_ready=0).
@@ -511,32 +805,15 @@ endgenerate
 // relies on. The core now decodes ioctl_addr ranges instead of
 // ioctl_index for everything.
 //------------------------------------------------------------------
-// 2026-07-12 session diagnostic: sound region removed from the MRA
-// entirely (previously a 1MB fill/dropped placeholder at this offset;
-// see mra/SuperOffRoad.mra) to test whether ioctl_download misbehaves
-// around a huge dead span immediately preceding gfx_rom's first real
-// bytes -- gfx_wr_count read exactly 0 on hardware every time despite
-// prom_rom (the next region over) loading correctly, and two prior
-// MRA-only variations (all-fill, then partial-real-data) both showed
-// no change. This removes the gap variable completely instead of
-// partially: GFX now starts immediately where the sound region used
-// to (ADDR_SOUND_LO's old value), and PROM/PROM_HI shift down by the
-// same 0x100000 the sound region used to occupy. ADDR_SOUND_LO itself
-// is unchanged -- it's still the correct SDRAM/BRAM boundary, just now
-// immediately adjacent to GFX with nothing in between.
-// 2026-07-12 session, reverted: the sound-region-removal experiment
-// (GFX/PROM addresses shifted down 0x100000, sound region dropped
-// from the MRA entirely) showed zero change in gfx_rom's write-hit
-// counter, so it didn't confirm the theory it was testing -- and the
-// very next build (with this revert not yet applied) showed prom_rom
-// had ALSO gone completely dead (prom_fp_u69 read 00, expected 69),
-// something never seen before that removal. Reverting back to the
-// original layout (sound gap restored in the MRA, addresses back to
-// their original values) to isolate whether that specific experiment
-// caused the prom_rom regression, or whether the bug predates it.
-localparam [26:0] ADDR_SOUND_LO = 27'h0C0000; // 1MB unemulated sound ROM, dropped
-localparam [26:0] ADDR_GFX_LO   = 27'h1C0000; // 96KB gfx tile ROM -> BRAM
-localparam [26:0] ADDR_PROM_LO  = 27'h1D8000; // 128KB palette PROM -> BRAM
+// Region routing now goes through rtl/leland_board_pkg.sv's canonical
+// layout constants (WP-L1) instead of hand-kept local ADDR_* offsets.
+// The upper bound admitting Sound ROM through the same gate/FIFO/drain
+// pipeline as Master/Slave is ADDR_GFX_BASE, same rationale as before
+// this rewrite: sound ROM shares this pipeline's exact destination
+// (SDRAM, flat-address==SDRAM-address post-header-subtract, same
+// even/odd pairing) with Master/Slave, unlike GFX/PROM (which land in
+// BRAM via their own independent gate below).
+//------------------------------------------------------------------
 
 // ioctl_addr, one clk_sys cycle delayed. Declared here (ahead of its
 // first use just below) rather than down near the write-path logic
@@ -544,7 +821,84 @@ localparam [26:0] ADDR_PROM_LO  = 27'h1D8000; // 128KB palette PROM -> BRAM
 // declare-before-use (e.g. vlog) rejected the forward reference.
 reg [26:0] ioctl_addr_d1;
 always @(posedge clk_sys) ioctl_addr_d1 <= ioctl_addr;
-localparam [26:0] ADDR_PROM_HI  = 27'h1F8000; // end of flat ROM image
+
+//------------------------------------------------------------------
+// 16-byte MRA header parse (plan section 3): the first HDR_LEN bytes
+// of the ioctl_index==0 stream are the header, not ROM content.
+// sdram_addr is only meaningful once ioctl_addr_d1 has advanced past
+// the header.
+//------------------------------------------------------------------
+wire ioctl_wr_hdr = ioctl_wr && ioctl_download && (ioctl_index[7:0] == 8'h00) &&
+                    (ioctl_addr_d1 < HDR_LEN[26:0]);
+
+reg [7:0] hdr_board_class_raw;
+reg [7:0] hdr_game_id;
+reg [7:0] hdr_input_scheme_raw;
+reg [7:0] hdr_flags;
+
+always @(posedge clk_sys) begin
+	if (ioctl_wr_hdr) begin
+		case (ioctl_addr_d1[3:0])
+			HDR_OFF_BOARD_CLASS[3:0]:  hdr_board_class_raw  <= ioctl_data;
+			HDR_OFF_GAME_ID[3:0]:      hdr_game_id           <= ioctl_data;
+			HDR_OFF_INPUT_SCHEME[3:0]: hdr_input_scheme_raw  <= ioctl_data;
+			HDR_OFF_FLAGS[3:0]:        hdr_flags             <= ioctl_data;
+			default: ; // magic/version/reserved: not consumed by the loader
+		endcase
+	end
+end
+
+// board_id drives a real runtime mux from day one (plan section 9,
+// "SNK lesson"): board_class selects the write-gate's upper bound via
+// a genuine case statement, even though every populated game table row
+// currently resolves to the same GEN3_LELANDI value. Later WPs (L3+)
+// add board classes/games whose branches genuinely diverge here.
+board_class_e board_class_r;
+assign board_class_r = board_class_e'(hdr_board_class_raw);
+
+// WP-L3: game_id (header byte 3) indexes the package's per-game config
+// table (leland_board_pkg::game_cfg) for I/O port bases / input scheme /
+// flags, rather than deriving them only from the raw header bytes. The
+// header's own board_class/input_scheme/flags bytes are kept as sanity-
+// check values (plan section 3: "loader can sanity-check the MRA against
+// the RBF's table"); the table is authoritative and drives real muxes.
+leland_board_pkg::game_cfg_t game_cfg_r;
+assign game_cfg_r = leland_board_pkg::game_cfg(hdr_game_id);
+
+wire [7:0] io_base_r    = game_cfg_r.io_base;
+wire [7:0] mvram_base_r = game_cfg_r.mvram_base;
+wire       dual_io_window_r = game_cfg_r.flags[leland_board_pkg::FLAG_DUAL_IO_WINDOW];
+wire       in4_port_en_r    = game_cfg_r.flags[leland_board_pkg::FLAG_IN4_PORT];
+leland_board_pkg::input_scheme_e input_scheme_r;
+assign input_scheme_r = game_cfg_r.input_scheme;
+
+// WP-L2: gfx/prom tile ROMs moved from BRAM to SDRAM (see the rd2
+// arbiter channel above and sor_video.sv's fetch FSM) -- they are now
+// "just more SDRAM content" routed through the same wfifo->SDRAM-write
+// pipeline as master/slave/sound, so the write-gate's upper bound moves
+// out from ADDR_GFX_BASE to ADDR_PROM_REAL_HI (real populated content
+// only, not the full PROM_MAX reservation -- matches the old BRAM
+// write-gate's own real-content bound, same rationale, see
+// ADDR_GFX_REAL_HI/ADDR_PROM_REAL_HI below).
+localparam [26:0] ADDR_GFX_REAL_HI  = ADDR_GFX_BASE  + 27'h018000;
+localparam [26:0] ADDR_PROM_REAL_HI = ADDR_PROM_BASE + 27'h020000;
+// WP-L3: the MRA now carries the per-game EEPROM default image (128
+// bytes = 64 x 16-bit words) at ADDR_EEPROM_BASE, consumed by the boot
+// FSM below. Write-gate upper bound extends out to cover it -- real
+// content only, same "real, not full reservation" convention as
+// ADDR_GFX_REAL_HI/ADDR_PROM_REAL_HI above.
+localparam [26:0] ADDR_EEPROM_REAL_HI = ADDR_EEPROM_BASE + 27'h000080;
+
+logic [26:0] wr_gate_hi;
+always @(*) begin
+	case (board_class_r)
+		GEN3_LELANDI: wr_gate_hi = ADDR_EEPROM_REAL_HI;
+		default:      wr_gate_hi = ADDR_EEPROM_REAL_HI;
+	endcase
+end
+
+// sdram_addr = ioctl_addr - HDR_LEN, valid once past the header.
+wire [26:0] sdram_addr = ioctl_addr_d1 - HDR_LEN[26:0];
 
 // ioctl_index==0 qualifier is MANDATORY alongside the address-range
 // check: the ARM sends more than ROM over ioctl. In particular the
@@ -558,27 +912,8 @@ localparam [26:0] ADDR_PROM_HI  = 27'h1F8000; // end of flat ROM image
 // F3/ED, then the DIP byte), and the readback scan showing 00s at
 // exactly the first addresses. Every established arcade core gates
 // its ROM write path on ioctl_index for precisely this reason.
-// Upper bound is ADDR_GFX_LO, not ADDR_SOUND_LO: this admits the
-// sound-ROM range (0x0C0000-0x1BFFFF) through the SAME gate/FIFO/drain
-// pipeline as Master/Slave, not a separate one. That's a deliberate
-// choice, not an oversight -- sound ROM shares this pipeline's exact
-// destination (SDRAM, flat-address==SDRAM-address, same even/odd
-// pairing) with Master/Slave, unlike GFX/PROM (which land in BRAM via
-// their own independent gate at ADDR_GFX_LO/ADDR_PROM_LO below) --
-// giving sound ROM a second FIFO here would just be duplicated risk in
-// the single most hardware-fragility-proven block in this file, for a
-// pipeline that already handles this shape of data correctly.
-// ADDR_SOUND_LO itself was the ORIGINAL upper bound, from when the
-// sound region was a dropped 1MB zero-fill placeholder (pre-WP10) --
-// leaving this gate there after the MRA started streaming real sound
-// ROM bytes silently dropped every one of them before they ever
-// reached SDRAM (found and fixed this session; see
-// docs/WP10_PROGRESS.md). See also wfifo's own width below, which
-// needed widening from 20 to 21 address bits for the same reason (20
-// bits only covered the old Master+Slave-only 0x000000-0x0BFFFF
-// range).
 wire ioctl_wr_rom = ioctl_wr && ioctl_download && (ioctl_index[7:0] == 8'h00) &&
-                    (ioctl_addr_d1 < ADDR_GFX_LO);
+                    (ioctl_addr_d1 >= HDR_LEN[26:0]) && (sdram_addr < wr_gate_hi);
 
 // DIP switches (ioctl_index 254): capture instead of discarding --
 // the game will eventually need them on an input port; for now this
@@ -587,22 +922,6 @@ reg [63:0] dips;
 always @(posedge clk_sys) begin
 	if (ioctl_wr && ioctl_download && (ioctl_index[7:0] == 8'hFE) && (ioctl_addr_d1 < 27'd8))
 		dips[ioctl_addr_d1[2:0]*8 +: 8] <= ioctl_data;
-end
-
-// Sanity-check counter, kept as an overlay row: total ioctl_download
-// falling edges seen. Measured at 02 for the single <rom index="0">
-// MRA on real hardware -- the ARM does not guarantee one download
-// session per <rom> tag, so "loading done" below is settle-timer
-// based (session-count-independent), not keyed off this value.
-reg       ioctl_download_r;
-reg [7:0] dbg_dl_sessions;
-always @(posedge clk_sys) begin
-	ioctl_download_r <= ioctl_download;
-	if (sdram_init) begin
-		dbg_dl_sessions <= 8'd0;
-	end else if (ioctl_download_r && !ioctl_download) begin
-		if (dbg_dl_sessions != 8'hFF) dbg_dl_sessions <= dbg_dl_sessions + 8'd1;
-	end
 end
 
 // "Downloads settled": at least one ioctl_download has been seen AND
@@ -644,16 +963,6 @@ end
 // suppress the address increment for a transfer's very first byte,
 // masking the bug there specifically while every subsequent byte in
 // the same transfer is silently shifted one address early.
-// Isolated single-byte write/readback self-test (see below): steals the
-// wr channel for exactly one transaction before ioctl loading logic
-// takes over. Safe — this only fires once, before the HPS ever starts
-// streaming ROM data (gated on sdram_ready, well before ioctl_download).
-wire        bt_write_active;
-wire [24:0] bt_wr_addr;
-wire  [7:0] bt_wr_data;    // low/even byte
-wire  [7:0] bt_wr_data_hi; // high/odd byte -- paired word write, same as the real ROM path
-reg         bt_wr_done;   // write half complete; declared here (used below) — defined in the byte-test block further down
-
 // Latched copies of ioctl_addr/ioctl_data/ioctl_index, captured the
 // same cycle a byte is accepted (ioctl_wr_rom && !wr_pending). The
 // actual SDRAM write is a multi-cycle transaction (accepted by the
@@ -672,89 +981,19 @@ reg         bt_wr_done;   // write half complete; declared here (used below) —
 reg [26:0] latched_ioctl_addr;      // always the EVEN (word) address of the pair
 reg  [7:0] latched_ioctl_data;      // low/even byte
 reg  [7:0] latched_ioctl_data_hi;   // high/odd byte -- see paired-write comment below
-reg        latched_ioctl_slave; // 1 = addr >= 0x040000, i.e. NOT Master ROM (Slave OR,
-                                 // since this session, Sound ROM too -- name kept for
-                                 // history, but every consumer below only ever tests
-                                 // !latched_ioctl_slave meaning "is this Master ROM", so
-                                 // Sound ROM correctly falling under the 1-case is fine)
+reg        latched_ioctl_slave; // 1 = sdram_addr >= ADDR_SLAVE_BASE, i.e. NOT Master ROM
+                                 // (Slave OR Sound ROM -- name kept for history; not
+                                 // consumed downstream, kept for debug visibility only)
 
-// Master (0x000000-0x03FFFF) and Slave (0x040000-0x0BFFFF) ROM are
-// contiguous in the flat MRA address space AND numerically identical
+// Master (0x000000+) and Slave/Sound (ADDR_SLAVE_BASE+) ROM share this
+// pipeline in the flat post-header address space AND are numerically identical
 // to their SDRAM addresses -- no per-region offset math needed at all,
 // unlike the old ioctl_index-keyed version. Straight pass-through.
-assign sdram_wr_addr    = bt_write_active ? bt_wr_addr    : latched_ioctl_addr[24:0];
-assign sdram_wr_data    = bt_write_active ? bt_wr_data    : latched_ioctl_data;
-assign sdram_wr_data_hi = bt_write_active ? bt_wr_data_hi : latched_ioctl_data_hi;
-
-// Accept-time ground truth, upstream of everything else: does HPS ever
-// even present address 0 (ioctl_index==0) with ioctl_wr asserted at
-// all? Taps ioctl_addr_d1/ioctl_data/ioctl_index at the exact instant
-// a byte is accepted -- before the write-port mux, before the SDRAM
-// controller ever sees it. (Originally written against the live,
-// undelayed ioctl_addr, back when the one-cycle skew above was still
-// undiscovered -- this was in fact the very probe that exposed it:
-// it caught byte 0's correct data purely because `skip_add` masks the
-// bug for a transfer's first byte specifically.) The isolated
-// byte-test bypasses this entire path (it drives bt_wr_addr/bt_wr_data
-// directly, never touching ioctl_addr/data), so it can't tell us
-// anything about whether this path itself ever fires for address 0.
-// dbg_accept0_cnt saturates at 0xFF; dbg_accept0_data latches only on
-// the FIRST occurrence.
-reg  [7:0] dbg_accept0_cnt;
-reg  [7:0] dbg_accept0_data;
-reg        dbg_accept0_seen;
-// Direct A/B check of the derived skew theory: the RAW (undelayed)
-// ioctl_addr's low byte, captured at the exact same first-occurrence
-// event as dbg_accept0_data. If ioctl_addr_d1==0 at that moment and
-// the skew theory is right, raw ioctl_addr should read 1 here (already
-// advanced); if it also reads 0, the derived one-cycle skew doesn't
-// actually exist as described and the theory needs to be discarded.
-// RESULT: read back 0x00 -- skew theory disproven, ioctl_addr_d1 kept
-// (harmless, proven equivalent to live ioctl_addr in practice) but no
-// longer load-bearing for any fix.
-reg  [7:0] dbg_accept0_raw_addr;
-
-// Same accept-time probe, applied to address 1: is address 0's
-// behavior (accepted repeatedly, ack-time capture never fires)
-// specific to address 0, or does address 1 show the same pattern?
-// If addresses 0 AND 1 both get accepted multiple times with correct
-// data, but ack-time (dbg_wr_b2/b3, watching addresses 2/3) never
-// fires at all, that localizes the anomaly to "the first couple of
-// bytes of a transfer" rather than "address 0 specifically".
-reg  [7:0] dbg_accept1_cnt;
-reg  [7:0] dbg_accept1_data;
-reg        dbg_accept1_seen;
-
-// Re-test the skew theory where it actually matters: the root-cause
-// comment above claims the transfer's very first byte is specifically
-// EXEMPT from the skew (via hps_io's own `skip_add` mechanism), which
-// means the earlier A/B disproof -- done at address 0 -- tested the
-// one byte the theory itself predicts would show no skew. It proved
-// nothing about byte 2+. Re-run the same raw-vs-delayed comparison at
-// address 2: if ioctl_addr_d1==2 here but the RAW (undelayed)
-// ioctl_addr reads 3 (already advanced), the skew is real for this
-// byte and ioctl_addr_d1 is load-bearing; if raw also reads 2, the
-// skew genuinely doesn't exist here either.
-reg  [7:0] dbg_accept2_data;
-reg  [7:0] dbg_accept2_raw_addr;
-reg        dbg_accept2_seen;
-
-// Most decisive remaining test: read address 0 back IMMEDIATELY after
-// its own write acknowledges -- essentially zero elapsed time, unlike
-// dbg_early_b0 which still waits for the rest of the ~256KB Master ROM
-// to finish loading first (still potentially tens of ms later).
-// accept0/accept1 already proved correct data (0xF3/0xED) reaches the
-// write-acceptance stage; if THIS also reads back wrong, the fault is
-// in the actual SDRAM write or in reading it back moments later --
-// not decay, not anything ioctl/HPS-side. Set here (write-ack side);
-// consumed by the rd_phase state machine below (sole driver of the
-// rd2 channel), which is idle (parked in RD_IDLE) throughout the real
-// Master ROM load in this design, so stealing it briefly here doesn't
-// conflict with the byte-test/early-checkpoint/main-scan users, which
-// all run later.
-reg       immediate_verify_want;
-reg       immediate_verify_done;
-reg [7:0] dbg_immediate_b0;
+// Renamed to _ioctl (final sdram_wr_* muxed against the gfx-repack FSM
+// further below, after wr_pending/dl_settled are in scope).
+wire [24:0] sdram_wr_addr_ioctl    = latched_ioctl_addr[24:0];
+wire  [7:0] sdram_wr_data_ioctl    = latched_ioctl_data;
+wire  [7:0] sdram_wr_data_hi_ioctl = latched_ioctl_data_hi;
 
 //------------------------------------------------------------------
 // NON-LOSSY ioctl capture: skid FIFO between hps_io and the SDRAM
@@ -785,18 +1024,20 @@ reg [7:0] dbg_immediate_b0;
 // orders of magnitude more headroom than the burst spacing needs.
 //------------------------------------------------------------------
 localparam WFIFO_AW = 5;                    // 32 entries
-// {addr[20:0], data[7:0]}: 21 address bits (widened this session from
-// the original 20 -- see docs/WP10_PROGRESS.md) to cover the full
-// 0x000000-0x1BFFFF Master+Slave+Sound flat range now that
-// ioctl_wr_rom's own gate above admits Sound ROM through this same
-// pipeline (0x1BFFFF needs 21 bits; the old 20-bit field only covered
-// up to 0x0FFFFF, silently wrapping/aliasing anything at or above
-// 0x100000 back onto Master/Slave's own addresses -- exactly the kind
-// of corruption a naive "just widen the gate" fix would have caused
-// without also widening this). The master/slave/sound split is
-// derived from the address at drain time, no separate per-region flag
-// needed now that addressing is flat.
-reg [28:0] wfifo [0:(1<<WFIFO_AW)-1];
+// {addr[22:0], data[7:0]}: 23 address bits (widened this WP from 22 --
+// WP-L2 moves the write-gate upper bound out to ADDR_PROM_REAL_HI=
+// 0x620000, which needs 23 bits: 0x61FFFF (highest real address below
+// the gate) is 0x61FFFF < 0x800000 (2^23) but > 0x3FFFFF (2^22), so the
+// old 22-bit field (max representable 0x3FFFFF, WP-L1's bound) would
+// silently wrap/alias anything at or above 0x400000 -- exactly the gfx/
+// prom range this WP newly routes through this FIFO. This is the same
+// class of bug that once caused real missing-playfield-graphics
+// corruption on hardware (see WP-L1's own widening comment history);
+// checked carefully here for the same reason. Field holds sdram_addr
+// (post-header-subtract), not ioctl_addr_d1. The master/slave/sound/
+// gfx/prom region split is derived from the address at drain time, no
+// separate per-region flag needed now that addressing is flat.
+reg [30:0] wfifo [0:(1<<WFIFO_AW)-1];
 reg [WFIFO_AW:0] wfifo_wptr, wfifo_rptr;    // extra bit for full/empty
 wire [WFIFO_AW:0] wfifo_level = wfifo_wptr - wfifo_rptr;
 wire [WFIFO_AW-1:0] wfifo_rptr_p1 = wfifo_rptr[WFIFO_AW-1:0] + 1'b1; // odd entry of a pair
@@ -808,58 +1049,20 @@ wire wfifo_full  = wfifo_level[WFIFO_AW];
 // bad (kept for future debug visibility).
 reg wfifo_overflow;
 
-// Enqueue: every ROM strobe, one cycle, no busy check. Uses
-// ioctl_addr_d1 -- hardware probes proved raw and delayed addr are
-// identical at strobe time, so d1 is safe and unchanged from the
-// proven-correct capture timing.
+// Enqueue: every ROM strobe, one cycle, no busy check. Uses sdram_addr
+// (ioctl_addr_d1 - HDR_LEN) -- hardware probes proved raw and delayed
+// addr are identical at strobe time, so the d1-derived value is safe
+// and unchanged from the proven-correct capture timing.
 always @(posedge clk_sys) begin
 	if (sdram_init) begin
 		wfifo_wptr     <= '0;
 		wfifo_overflow <= 1'b0;
 	end else if (ioctl_wr_rom) begin
 		if (!wfifo_full) begin
-			wfifo[wfifo_wptr[WFIFO_AW-1:0]] <= {ioctl_addr_d1[20:0], ioctl_data};
+			wfifo[wfifo_wptr[WFIFO_AW-1:0]] <= {sdram_addr[22:0], ioctl_data};
 			wfifo_wptr <= wfifo_wptr + 1'd1;
 		end else begin
 			wfifo_overflow <= 1'b1;
-		end
-	end
-end
-
-// Accept-time ground-truth probes, now keyed off the enqueue event
-// (same sampling instant as before -- the strobe cycle itself).
-always @(posedge clk_sys) begin
-	if (sdram_init) begin
-		dbg_accept0_cnt      <= 8'h00;
-		dbg_accept0_data     <= 8'h00;
-		dbg_accept0_seen     <= 1'b0;
-		dbg_accept0_raw_addr <= 8'h00;
-		dbg_accept1_cnt      <= 8'h00;
-		dbg_accept1_data     <= 8'h00;
-		dbg_accept1_seen     <= 1'b0;
-		dbg_accept2_data     <= 8'h00;
-		dbg_accept2_raw_addr <= 8'h00;
-		dbg_accept2_seen     <= 1'b0;
-	end else if (ioctl_wr_rom && (ioctl_addr_d1 < 27'h040000)) begin
-		if (ioctl_addr_d1 == 27'd0) begin
-			if (dbg_accept0_cnt != 8'hFF) dbg_accept0_cnt <= dbg_accept0_cnt + 8'd1;
-			if (!dbg_accept0_seen) begin
-				dbg_accept0_seen     <= 1'b1;
-				dbg_accept0_data     <= ioctl_data;
-				dbg_accept0_raw_addr <= ioctl_addr[7:0];
-			end
-		end
-		if (ioctl_addr_d1 == 27'd1) begin
-			if (dbg_accept1_cnt != 8'hFF) dbg_accept1_cnt <= dbg_accept1_cnt + 8'd1;
-			if (!dbg_accept1_seen) begin
-				dbg_accept1_seen <= 1'b1;
-				dbg_accept1_data <= ioctl_data;
-			end
-		end
-		if ((ioctl_addr_d1 == 27'd2) && !dbg_accept2_seen) begin
-			dbg_accept2_seen     <= 1'b1;
-			dbg_accept2_data     <= ioctl_data;
-			dbg_accept2_raw_addr <= ioctl_addr[7:0];
 		end
 	end
 end
@@ -890,20 +1093,18 @@ always @(posedge clk_sys) begin
 	if (sdram_init) begin
 		wr_pending            <= 1'b0;
 		wfifo_rptr            <= '0;
-		immediate_verify_want <= 1'b0;
 	end
 	else if (sdram_wr_ack) begin
 		wr_pending <= 1'b0;
-		if (ENABLE_SDRAM_DIAG_TRAFFIC && ENABLE_MIDLOAD_DIAG_READS && !latched_ioctl_slave && (latched_ioctl_addr == 27'd0) && !immediate_verify_done)
-			immediate_verify_want <= 1'b1;
 	end
 	else if (!wr_pending && (wfifo_level >= 2)) begin
 		wr_pending            <= 1'b1;
 		// Even entry (low byte) -- its address is the word address.
-		// [28:8] = the 21-bit address field (widened this session, see
-		// wfifo's own declaration comment above).
-		latched_ioctl_addr    <= {6'b0, wfifo[wfifo_rptr[WFIFO_AW-1:0]][28:8]};
-		latched_ioctl_slave   <= (wfifo[wfifo_rptr[WFIFO_AW-1:0]][28:8] >= 21'h40000);
+		// [30:8] = the 23-bit address field (widened this WP, see
+		// wfifo's own declaration comment above). This is sdram_addr,
+		// i.e. already past the 16-byte header subtract.
+		latched_ioctl_addr    <= {4'b0, wfifo[wfifo_rptr[WFIFO_AW-1:0]][30:8]};
+		latched_ioctl_slave   <= (wfifo[wfifo_rptr[WFIFO_AW-1:0]][30:8] >= ADDR_SLAVE_BASE[22:0]);
 		latched_ioctl_data    <= wfifo[wfifo_rptr[WFIFO_AW-1:0]][7:0];
 		// Odd entry (high byte) -- guaranteed to be rptr+1.
 		latched_ioctl_data_hi <= wfifo[wfifo_rptr_p1][7:0];
@@ -911,13 +1112,6 @@ always @(posedge clk_sys) begin
 	end
 end
 
-assign sdram_wr_req = bt_write_active | wr_pending;
-// The isolated byte-test's write now runs strictly after the entire
-// ROM load finishes (triggered on `reset` falling — see bt_wstate
-// above), so it can no longer overlap with real ioctl_wr traffic on
-// the shared wr channel by construction (the FIFO is drained long
-// before reset falls).
-//
 // ioctl_wait: assert while SDRAM init is pending, and once the FIFO
 // reaches half full. NOT per-byte -- the ARM reacts to this in
 // software with real latency, so it must be an early warning with
@@ -926,888 +1120,275 @@ assign sdram_wr_req = bt_write_active | wr_pending;
 // software polling rate at best and lost bytes at worst.
 assign ioctl_wait   = (wfifo_level >= (1<<(WFIFO_AW-1))) | ~sdram_ready;
 
-// ioctl_wait activity diagnostic (2026-07-12 session, following up on
-// the prom_rom-also-dead finding): ioctl_wait is a GLOBAL stall signal
-// -- it doesn't distinguish "this byte is headed for SDRAM" from
-// "this byte is headed for gfx_rom/prom_rom BRAM". It only gets
-// asserted from SDRAM/wfifo backpressure (which can only happen during
-// the Master/Slave ROM portion of the stream, addresses before
-// ADDR_SOUND_LO), but once asserted it pauses the ENTIRE HPS byte
-// stream, including bytes destined for gfx_rom/prom_rom much later.
-// The ARM only reacts to this in software with real latency (see the
-// wfifo comment above), so a resume-after-stall firmware quirk
-// happening early could plausibly corrupt something that only
-// manifests once the stream reaches gfx/prom far downstream.
+//------------------------------------------------------------------
+// Wider-reads bandwidth optimization (2026-07-22, post-hardware-bringup
+// sanity check -- see docs/planning_video_sdram_prefetch.md): builds a
+// repacked COPY of bg_gfx planes 0+1, interleaved into 16-bit words
+// (word i = {plane1[i], plane0[i]}), at ADDR_GFXW_BASE. The real
+// ADDR_GFX_BASE content stays byte-for-byte exactly as loaded (still
+// matching the MRA/MAME ROM_LOAD layout) -- this is a derived cache
+// built AFTER loading, not a relayout of the load itself. Lets
+// sor_video.sv's fetch FSM read both bitplane bytes needed per tile-row
+// in one 16-bit SDRAM transaction instead of two 8-bit ones, directly
+// cutting rd2 bus demand rather than fighting over arbiter priority
+// (which the same investigation found to be zero-sum against CPU/sound
+// -- see the rd2_fetch_busy/aging-boost comment above).
 //
-// First pass (combined ioctl_wait) came back W=1, exactly 1 rising
-// edge -- genuinely ambiguous, since ioctl_wait is OR'd from two
-// different causes (wfifo_level half-full, and ~sdram_ready). A single
-// assertion is exactly what a brief ~sdram_ready during SDRAM's own
-// power-on init sequence would produce -- normal on every boot,
-// unrelated to this theory -- and much less consistent with genuine
-// wfifo backpressure, which would more plausibly fire more than once
-// across a real Master+Slave ROM load if it fired at all. Split into
-// two independent sticky bits + counts to attribute the single edge
-// to its actual cause.
-reg       ever_wfifo_stall, ever_sdram_notready;
-reg [7:0] wfifo_stall_rise_count, sdram_notready_rise_count;
-reg       wfifo_stall_prev, sdram_notready_prev;
-wire      wfifo_stall_now = (wfifo_level >= (1<<(WFIFO_AW-1)));
+// One-shot boot-time FSM. Runs after dl_settled (all real ROM loading
+// finished and settled) and before video_release, borrowing the rd2 and
+// wr arbiter channels: rd2 is guaranteed idle in this window because
+// sor_video stays held in reset until video_release, which THIS FSM
+// gates (repack_done, see video_release below) so it cannot start
+// requesting rd2 until repack has already finished with it; wr is
+// guaranteed idle because wr_pending is driven off the ioctl write-back
+// FIFO, which drains continuously at SDRAM pace throughout the download
+// and is empty well before dl_settled's extra DL_SETTLE_CYCLES margin
+// elapses (checked explicitly below anyway, belt-and-suspenders). No
+// real per-cycle arbitration needed between repack and the ioctl
+// loader/sor_video -- just a mux, since the two are mutually exclusive
+// in time by construction.
+localparam [16:0] REPACK_LEN = 17'h8000; // one plane's worth of bytes
+
+// WP-M8 (2026-07-24): extended with RP_RD2_REQ/WAIT (fetch plane2) and
+// RP_WR2_REQ/WAIT (write the ADDR_GFXROW_BASE combined 4-byte entry) --
+// purely additive alongside the original RD0/RD1/WR sequence, which still
+// builds ADDR_GFXW_BASE exactly as before. See leland_board_pkg.sv's
+// ADDR_GFXROW_BASE comment for the entry layout.
+typedef enum logic [3:0] {
+	RP_IDLE, RP_RD0_REQ, RP_RD0_WAIT, RP_RD1_REQ, RP_RD1_WAIT,
+	RP_RD2_REQ, RP_RD2_WAIT,
+	RP_WR_REQ, RP_WR_WAIT, RP_WR2_REQ, RP_WR2_WAIT,
+	RP_WR3_REQ, RP_WR3_WAIT, RP_DONE
+} repack_state_e;
+
+repack_state_e repack_st;
+reg [16:0] repack_idx;
+reg  [7:0] repack_b0;
+reg  [7:0] repack_b2; // plane2 byte, latched at RP_RD2_WAIT for the GFXROW word1 write
+reg        repack_done;
+
+reg        repack_rd_req_r;
+reg [24:0] repack_rd_addr_r;
+reg        repack_wr_req_r;
+reg [24:0] repack_wr_addr_r;
+reg  [7:0] repack_wr_data_r, repack_wr_data_hi_r;
+
+wire repack_active = (repack_st != RP_IDLE) && (repack_st != RP_DONE);
+
 always @(posedge clk_sys) begin
 	if (sdram_init) begin
-		ever_wfifo_stall          <= 1'b0;
-		ever_sdram_notready       <= 1'b0;
-		wfifo_stall_rise_count    <= 8'd0;
-		sdram_notready_rise_count <= 8'd0;
-		wfifo_stall_prev          <= 1'b0;
-		sdram_notready_prev       <= 1'b0;
+		repack_st       <= RP_IDLE;
+		repack_idx      <= 17'd0;
+		repack_done     <= 1'b0;
+		repack_rd_req_r <= 1'b0;
+		repack_wr_req_r <= 1'b0;
 	end else begin
-		wfifo_stall_prev    <= wfifo_stall_now;
-		sdram_notready_prev <= ~sdram_ready;
-		if (wfifo_stall_now)  ever_wfifo_stall    <= 1'b1;
-		if (~sdram_ready)     ever_sdram_notready <= 1'b1;
-		if (wfifo_stall_now && !wfifo_stall_prev && (wfifo_stall_rise_count != 8'hFF))
-			wfifo_stall_rise_count <= wfifo_stall_rise_count + 8'd1;
-		if (~sdram_ready && !sdram_notready_prev && (sdram_notready_rise_count != 8'hFF))
-			sdram_notready_rise_count <= sdram_notready_rise_count + 8'd1;
-	end
-end
+		case (repack_st)
+			RP_IDLE: if (dl_settled && !wr_pending) repack_st <= RP_RD0_REQ;
 
-//------------------------------------------------------------------
-// Diagnostic: isolated single-byte SDRAM write/readback self-test
-//
-// Completely independent of ROM loading, ROM content, and the CPUs —
-// the simplest possible proof that the raw SDRAM datapath can store
-// and retrieve one byte correctly. Runs once, immediately after SDRAM
-// init completes (before any ioctl download), at a fixed address far
-// outside every real ROM region (Master 0x000000-0x03FFFF, Slave
-// 0x040000-0x0BFFFF, and -- since this session -- Sound
-// 0x0C0000-0x1BFFFF too, now that it's real live SDRAM content and no
-// longer a dropped placeholder) so it can never collide with real ROM
-// data.
-//
-// If this fails, the bug is in the raw SDRAM controller/datapath
-// itself (FSM timing, DQM, address decode) independent of anything
-// ROM-loading or CPU-arbitration related. If it passes, the bug is
-// specific to sustained/concurrent access patterns (arbitration under
-// load, ROM-sized address ranges, or interaction with the ioctl
-// loader) and this test has ruled out the simplest explanation.
-//
-// BT_ADDR moved this session from 0x100000 to 0x200000: the old value
-// fell inside the Sound ROM's own range (0x0C0000-0x1BFFFF) once that
-// became real, live content instead of a dropped fill -- would have
-// let the byte-test's A5/5A pattern corrupt real sound-CPU ROM bytes
-// at its own address (mid-load) and, on real hardware, wherever the
-// byte-test's own write landed relative to the sound ROM's actual
-// content after load. 0x200000 sits past even GFX/PROM's flat
-// addresses (0x1C0000-0x1F7FFF, BRAM-routed, never touches SDRAM) --
-// clear of every real consumer of this SDRAM, not just the ROM ranges.
-//------------------------------------------------------------------
-localparam [24:0] BT_ADDR     = 25'h200000; // 2MB in — far outside every real ROM region (even)
-localparam [24:0] BT_ADDR2    = 25'h200001; // adjacent odd address, same 16-bit word
-localparam [7:0]  BT_PATTERN  = 8'hA5;
-localparam [7:0]  BT_PATTERN2 = 8'h5A;      // distinct value -- a lane swap is visible either way
-
-// PAIRED byte-test: write BT_PATTERN to the even address and
-// BT_PATTERN2 to the ODD address immediately after (same 16-bit SDRAM
-// word), then read both back. This fingerprints the even/odd
-// corruption seen on hardware (scan reads ED ED 31 31 -- odd bytes
-// correct, even bytes clobbered by their odd neighbor -- exactly what
-// a stuck DQM/byte-lane-select would produce). The original single-
-// address test used ONE address for both write and read, so a
-// symmetric lane fault (write always hits lane X, read always samples
-// lane X) cancels out and reports P regardless -- it could never have
-// caught this. Four readback outcomes fingerprint four different
-// faults:
-//   A5 5A -- lanes fine, this theory is dead, look elsewhere
-//   5A 5A -- both ops pinned to one lane (matches the ED ED / 31 31
-//            pattern seen on the real scan)
-//   5A xx -- write address bit 0 (byte_sel) stuck at 0
-//   xx 5A -- write address bit 0 stuck at 1
-//
-// Write-side only here (single driver of the wr channel mux). The
-// read-back half runs inside the rd2-scan always block below, since
-// sdram_rd2_req/addr must have exactly one driver — it runs as a
-// phase that precedes the big 256KB scan, gated on bt_wr_done.
-//
-// ONE paired word write now (not two sequential byte writes): matches
-// the real ROM path exactly (see the paired-write comment on the
-// drain logic above) -- both bytes known up front, single 16-bit
-// write, DQM held at 2'b00. An earlier version of this test did two
-// separate byte writes with a gap state between them; that's now
-// simply how the real ROM writes work too, so there's no reason for
-// the byte-test to do anything different.
-localparam BT_IDLE=0, BT_WR_WAIT=1, BT_WR_DONE=2;
-reg [1:0] bt_wstate;
-reg       bt_pass;       // BOTH bytes read back correctly
-reg       bt_done;       // write+both reads complete
-reg [7:0] bt_readback;   // even address (BT_ADDR)
-reg [7:0] bt_readback2;  // odd address  (BT_ADDR2)
-reg       bt_reset_prev;
-
-assign bt_write_active = (bt_wstate == BT_WR_WAIT);
-assign bt_wr_addr    = BT_ADDR;
-assign bt_wr_data    = BT_PATTERN;
-assign bt_wr_data_hi = BT_PATTERN2;
-
-always @(posedge clk_sys) begin
-	bt_reset_prev <= reset;
-	if (sdram_init) begin
-		bt_wstate  <= BT_IDLE;
-		bt_wr_done <= 1'b0;
-	end else begin
-		case (bt_wstate)
-			// Triggered on `reset` falling (all ROM loading fully done),
-			// not on sdram_ready rising (well before ioctl_download even
-			// starts). Previously this self-test's write shared the wr
-			// channel with the very start of the real HPS ROM stream --
-			// the intended safeguard (ioctl_wait includes ~bt_wr_done, so
-			// HPS should not send anything until this completes) assumes
-			// HPS reacts to ioctl_wait with no buffering/burst-ahead.
-			// Hardware evidence said otherwise: the write-side ground-
-			// truth debug row showed Master ROM addresses 0-3 never
-			// written at all, even after fixing a related but different
-			// race (latching ioctl_addr/data at accept-time). Running
-			// this strictly after the entire load finishes removes any
-			// temporal overlap with the real ROM stream by construction,
-			// rather than depending on exact HPS-side wait-signal timing.
-			// dl_settled (session-count-independent), not a reset edge:
-			// see the DL_SETTLE_CYCLES parameter comment -- hardware
-			// showed the single <rom> tag still isn't one download
-			// session in practice.
-			BT_IDLE:    if (ENABLE_SDRAM_DIAG_TRAFFIC && dl_settled) bt_wstate <= BT_WR_WAIT;
-			BT_WR_WAIT: if (sdram_wr_ack) begin bt_wr_done <= 1'b1; bt_wstate <= BT_WR_DONE; end
-			default: ; // BT_WR_DONE: stay
-		endcase
-	end
-end
-
-//------------------------------------------------------------------
-// Diagnostic: SDRAM write/readback integrity check for Master ROM
-//
-// Accumulates an 8-bit running sum of every byte actually accepted
-// (wr_ack'd) by the SDRAM controller while loading the Master ROM
-// (ioctl_index 0x00, 256 KB). Once loading finishes, a dedicated
-// scanner (using the new rd2 diagnostic read port, so it never
-// contends with the live CPUs) walks the same 256 KB region back out
-// of SDRAM and accumulates an identical running sum. If the two sums
-// match, the SDRAM write→read pipeline is provably lossless for this
-// data; a mismatch proves data corruption in that pipeline itself
-// (as opposed to e.g. a wrong assumption about ROM content).
-//------------------------------------------------------------------
-// NOTE: ioctl_download can toggle between individual <part> files and
-// between ROM indices (the Master ROM alone is 4 separate parts under
-// index 0x00) — it is NOT a single continuous session that only drops
-// once at the very end. Resetting/triggering on its edges mid-load was
-// wiping the write checksum and starting the readback scan on a still-
-// incomplete ROM. Use the top-level `reset` instead (includes
-// ioctl_download and only deasserts once ALL parts of ALL ROMs have
-// finished loading) as the "loading is fully done" signal.
-// Split by address parity (even/odd byte) to test whether the SDRAM
-// controller's DQM low/high-byte write-select logic — the most custom,
-// bug-prone part of this design — is the source of any corruption.
-reg  [7:0] wr_chk, wr_chk_even, wr_chk_odd;
-// Per-64KB-quarter checksums — matches the Master ROM's 4 physical
-// files (u58t/u59t/u57t/u56t) so a mismatch localizes to one file.
-reg  [7:0] wr_chk_q0, wr_chk_q1, wr_chk_q2, wr_chk_q3;
-reg  [7:0] dbg_wr_b0, dbg_wr_b1, dbg_wr_b2, dbg_wr_b3; // actual bytes handed to SDRAM write port at addr 0-3
-always @(posedge clk_sys) begin
-	if (sdram_init) begin
-		wr_chk      <= 8'h00;
-		wr_chk_even <= 8'h00;
-		wr_chk_odd  <= 8'h00;
-		wr_chk_q0   <= 8'h00;
-		wr_chk_q1   <= 8'h00;
-		wr_chk_q2   <= 8'h00;
-		wr_chk_q3   <= 8'h00;
-		dbg_wr_b0   <= 8'h00;
-		dbg_wr_b1   <= 8'h00;
-		dbg_wr_b2   <= 8'h00;
-		dbg_wr_b3   <= 8'h00;
-	end else if (sdram_wr_ack && !latched_ioctl_slave && !bt_write_active) begin
-		// !bt_write_active excludes the isolated byte-test's write
-		// (originally at fixed address 0x100000, far outside the Master
-		// ROM range; moved to 0x200000 this session -- see BT_ADDR's own
-		// comment -- same "quarter-0" address-bit overlap this comment
-		// describes still applies at the new address, so this exclusion
-		// is still load-bearing, not just historical) from this
-		// accumulator. Without it, that write was being double-counted
-		// here — ioctl_index defaults to 0 before any real load even
-		// starts, and the byte-test address shares the same
-		// sdram_wr_addr[17:16]=00 bits as legitimate quarter-0 ROM
-		// addresses, so it silently landed in wr_chk/wr_chk_q0 while
-		// the readback scanner (bounded to 0x00000-0x3FFFF) never
-		// revisits it to match. That guaranteed a permanent false
-		// mismatch on the checksum diagnostic, unrelated to any real
-		// SDRAM data corruption — confirmed via sim/sor_board_tb.sv,
-		// which traced wr_chk_q0 accumulating a contribution from the
-		// byte-test's address that rd_chk_q0 (correctly) never sees.
-		// Every ack now covers a WHOLE 16-bit word (both bytes at once
-		// -- see the paired-write comment above), so accumulate both
-		// sdram_wr_data (even/low) and sdram_wr_data_hi (odd/high)
-		// per ack, not one byte per ack as before.
-		wr_chk      <= wr_chk + sdram_wr_data + sdram_wr_data_hi;
-		wr_chk_even <= wr_chk_even + sdram_wr_data;
-		wr_chk_odd  <= wr_chk_odd  + sdram_wr_data_hi;
-		// Ground-truth spot check on the WRITE side, mirroring
-		// dbg_scan_b0..b3 on the read side: latch the actual byte value
-		// the core hands to the SDRAM write port at addresses 0-3.
-		// Separates "the write path never got/forwarded the real ROM
-		// byte" from "the write landed fine but the read-back scan (or
-		// SDRAM itself) returns something different later" -- the
-		// checksum alone can't distinguish those.
-		if (sdram_wr_addr == 25'd0) begin
-			dbg_wr_b0 <= sdram_wr_data;
-			dbg_wr_b1 <= sdram_wr_data_hi;
-		end else if (sdram_wr_addr == 25'd2) begin
-			dbg_wr_b2 <= sdram_wr_data;
-			dbg_wr_b3 <= sdram_wr_data_hi;
-		end
-		case (sdram_wr_addr[17:16])
-			2'd0: wr_chk_q0 <= wr_chk_q0 + sdram_wr_data + sdram_wr_data_hi;
-			2'd1: wr_chk_q1 <= wr_chk_q1 + sdram_wr_data + sdram_wr_data_hi;
-			2'd2: wr_chk_q2 <= wr_chk_q2 + sdram_wr_data + sdram_wr_data_hi;
-			2'd3: wr_chk_q3 <= wr_chk_q3 + sdram_wr_data + sdram_wr_data_hi;
-		endcase
-	end
-end
-
-reg        rd_scan_active;
-reg        rd_scan_done;
-reg [17:0] rd_scan_addr;
-reg  [7:0] rd_chk, rd_chk_even, rd_chk_odd;
-reg  [7:0] rd_chk_q0, rd_chk_q1, rd_chk_q2, rd_chk_q3;
-reg        rd2_req_pend;
-reg  [7:0] dbg_scan_b0, dbg_scan_b1, dbg_scan_b2, dbg_scan_b3; // first 4 bytes read back from SDRAM addr 0-3
-
-// Saturating count of real rd2-channel completions (sdram_rd2_ack
-// pulses). Purely diagnostic: tells us, on the next hardware run,
-// whether dbg_scan_b0 -- which came back matching the byte-test's own
-// BT_PATTERN instead of the real ROM byte -- reflects a genuinely
-// fresh SDRAM transaction for address 0, or something upstream failed
-// to issue a real new transaction and it's a stale reuse.
-reg  [7:0] dbg_rd2_ack_cnt;
-always @(posedge clk_sys) begin
-	if (sdram_init) dbg_rd2_ack_cnt <= 8'h00;
-	else if (sdram_rd2_ack && dbg_rd2_ack_cnt != 8'hFF)
-		dbg_rd2_ack_cnt <= dbg_rd2_ack_cnt + 8'd1;
-end
-
-// Decisive time-based test: read address 0 back immediately after the
-// Master ROM finishes loading (ioctl_index transitions 0->1, meaning
-// the Slave ROM's ~512KB is just about to start -- correct data has
-// had almost no time to sit in SDRAM yet), rather than only at the
-// very end after everything (both ROMs, ~768KB, likely ~100+ ms) has
-// loaded. If this reads correctly but the final dbg_scan_b0 (end of
-// everything) doesn't, that's direct proof of decay over the load's
-// duration rather than a one-off logic/addressing bug -- accept0/
-// accept1 already proved the correct bytes (0xF3/0xED) reach the
-// write-acceptance stage, so the remaining open question is whether
-// SDRAM retains them over time.
-reg  [7:0] dbg_early_b0;
-reg [15:0] ioctl_index_prev;
-
-// Sticky level version of "loading is done" (see dl_settled below) --
-// removes any ordering dependency on catching a single-cycle pulse
-// from a specific state.
-reg loading_done;
-
-// Sole driver of sdram_rd2_req/sdram_rd2_addr: the byte-test readback
-// (BT_RD_*) runs first as soon as the write half completes, then the
-// big 256KB scan follows once the byte test is done.
-localparam RD_IDLE=0, RD_BT_REQ=1, RD_BT_WAIT=2, RD_EARLY_WAIT=5, RD_EARLY_ACK=6, RD_SCAN=3, RD_DONE=4, RD_IMMEDIATE_WAIT=7, RD_BT_WAIT2=8, RD_BT_REQ2=9,
-           RD_LIVE_IDLE=10, RD_LIVE_REQ=11, RD_LIVE_WAIT=12;
-reg [3:0] rd_phase; // widened 3->4 bits for RD_BT_WAIT2/RD_BT_REQ2 (paired byte-test read)
-
-// Live fetch-mismatch counter (docs/sdram_plan.md Section 2): once the
-// boot-time rd_scan finishes, keep polling a fixed Master-ROM address
-// (alternating both DQ byte lanes) at a slow, negligible-bandwidth
-// cadence for the rest of the session, converting "erratic behavior"
-// during gameplay into one number. rd2 stays lowest arbiter priority
-// (sel_rd2 above), so this has zero impact on CPU fetches.
-reg [15:0] live_timer = 16'd0;     // free-running; wraps every 65536 clk_sys cycles (~1.37ms @ 48MHz). Explicit
-                                    // initial value (Quartus power-up state), not a reset -- without it sim's
-                                    // X-initialized reg never resolves (X+1=X forever); real hardware doesn't
-                                    // have this problem (Quartus registers power up to their declared value).
-reg        live_lane;              // 0 = addr ...0100 (even), 1 = ...0101 (odd) -- covers both DQ byte lanes
-reg        live_ref_lo_set, live_ref_hi_set;
-reg  [7:0] live_ref_lo, live_ref_hi; // latched from the FIRST poll of each lane after rd_scan_done
-reg  [7:0] live_mm_cnt;            // saturating mismatch count (sticky)
-reg  [3:0] live_poll_cnt;          // free-running liveness counter -- must visibly spin on screen
-wire       live_tick = (live_timer == 16'hFFFF);
-localparam LIVE_ADDR_BASE = 25'h000100;
-
-always @(posedge clk_sys) begin
-	live_timer <= live_timer + 16'd1; // free-running, decoupled from rd_phase/reset
-end
-
-always @(posedge clk_sys) begin
-	ioctl_index_prev <= ioctl_index;
-	// dl_settled, not a reset edge -- see DL_SETTLE_CYCLES comment.
-	if (dl_settled) loading_done <= 1'b1;
-	if (sdram_init) begin
-		loading_done   <= 1'b0;
-		rd_phase       <= RD_IDLE;
-		rd_scan_active <= 1'b0;
-		rd_scan_done   <= 1'b0;
-		rd_scan_addr   <= 18'd0;
-		rd_chk         <= 8'h00;
-		rd_chk_even    <= 8'h00;
-		rd_chk_odd     <= 8'h00;
-		rd_chk_q0      <= 8'h00;
-		rd_chk_q1      <= 8'h00;
-		rd_chk_q2      <= 8'h00;
-		rd_chk_q3      <= 8'h00;
-		rd2_req_pend   <= 1'b0;
-		sdram_rd2_req  <= 1'b0;
-		bt_pass        <= 1'b0;
-		bt_done        <= 1'b0;
-		dbg_early_b0   <= 8'h00;
-		dbg_scan_b0    <= 8'h00;
-		dbg_scan_b1    <= 8'h00;
-		dbg_scan_b2    <= 8'h00;
-		dbg_scan_b3    <= 8'h00;
-		immediate_verify_done <= 1'b0;
-		dbg_immediate_b0      <= 8'h00;
-		live_lane        <= 1'b0;
-		live_ref_lo_set  <= 1'b0;
-		live_ref_hi_set  <= 1'b0;
-		live_ref_lo      <= 8'h00;
-		live_ref_hi      <= 8'h00;
-		live_mm_cnt      <= 8'h00;
-		live_poll_cnt    <= 4'h0;
-	end else begin
-		case (rd_phase)
-			// Highest priority within RD_IDLE: the immediate read-after-
-			// write verification (see immediate_verify_want above) --
-			// checked ahead of the normal bt_wr_done path since it needs
-			// to fire early, during the real Master ROM load, well
-			// before bt_wr_done ever becomes true in this design.
-			RD_IDLE: if (immediate_verify_want && !immediate_verify_done) begin
-				sdram_rd2_addr <= 25'd0;
-				sdram_rd2_req  <= 1'b1;
-				rd_phase       <= RD_IMMEDIATE_WAIT;
-			end else if (bt_wr_done) begin
-				sdram_rd2_addr <= BT_ADDR;
-				sdram_rd2_req  <= 1'b1;
-				rd_phase       <= RD_BT_WAIT;
+			// plane0[idx] -- ADDR_GFX_BASE + idx (u93, the first 32KB third)
+			RP_RD0_REQ: begin
+				repack_rd_addr_r <= ADDR_GFX_BASE[24:0] + {8'b0, repack_idx};
+				repack_rd_req_r  <= 1'b1;
+				repack_st        <= RP_RD0_WAIT;
+			end
+			RP_RD0_WAIT: if (sdram_rd2_ack) begin
+				repack_b0       <= sdram_rd2_data;
+				repack_rd_req_r <= 1'b0;
+				repack_st       <= RP_RD1_REQ;
 			end
 
-			RD_IMMEDIATE_WAIT: if (sdram_rd2_ack) begin
-				dbg_immediate_b0      <= sdram_rd2_data;
-				immediate_verify_done <= 1'b1;
-				sdram_rd2_req         <= 1'b0;
-				rd_phase              <= RD_IDLE;
+			// plane1[idx] -- ADDR_GFX_BASE + 0x8000 + idx (u94, the second third)
+			RP_RD1_REQ: begin
+				repack_rd_addr_r <= ADDR_GFX_BASE[24:0] + 25'h008000 + {8'b0, repack_idx};
+				repack_rd_req_r  <= 1'b1;
+				repack_st        <= RP_RD1_WAIT;
+			end
+			RP_RD1_WAIT: if (sdram_rd2_ack) begin
+				repack_wr_data_r    <= repack_b0;      // low byte  = plane0
+				repack_wr_data_hi_r <= sdram_rd2_data;  // high byte = plane1
+				repack_rd_req_r     <= 1'b0;
+				repack_st           <= RP_RD2_REQ;
 			end
 
-			// Drop req for a cycle between the two reads: the arbiter's
-			// in_flight fence only releases once the client's own req
-			// line drops (see the duplicate-transaction race fix) --
-			// changing the address while req stays asserted would get
-			// the second read silently ignored.
-			RD_BT_WAIT: if (sdram_rd2_ack) begin
-				bt_readback   <= sdram_rd2_data;
-				sdram_rd2_req <= 1'b0;
-				rd_phase      <= RD_BT_REQ2;
+			// plane2[idx] -- ADDR_GFX_BASE + 0x10000 + idx (u95, the third third)
+			RP_RD2_REQ: begin
+				repack_rd_addr_r <= ADDR_GFX_BASE[24:0] + 25'h010000 + {8'b0, repack_idx};
+				repack_rd_req_r  <= 1'b1;
+				repack_st        <= RP_RD2_WAIT;
+			end
+			RP_RD2_WAIT: if (sdram_rd2_ack) begin
+				repack_b2       <= sdram_rd2_data;
+				repack_rd_req_r <= 1'b0;
+				repack_st       <= RP_WR_REQ;
 			end
 
-			RD_BT_REQ2: begin
-				sdram_rd2_addr <= BT_ADDR2;
-				sdram_rd2_req  <= 1'b1;
-				rd_phase       <= RD_BT_WAIT2;
+			// combined word -> ADDR_GFXW_BASE + idx*2 (unchanged from before)
+			RP_WR_REQ: begin
+				repack_wr_addr_r <= ADDR_GFXW_BASE[24:0] + {repack_idx, 1'b0};
+				repack_wr_req_r  <= 1'b1;
+				repack_st        <= RP_WR_WAIT;
+			end
+			RP_WR_WAIT: if (sdram_wr_ack) begin
+				repack_wr_req_r <= 1'b0;
+				repack_st       <= RP_WR2_REQ;
 			end
 
-			RD_BT_WAIT2: if (sdram_rd2_ack) begin
-				bt_readback2  <= sdram_rd2_data;
-				bt_pass       <= (bt_readback == BT_PATTERN) && (sdram_rd2_data == BT_PATTERN2);
-				bt_done       <= 1'b1;
-				sdram_rd2_req <= 1'b0;
-				rd_phase      <= RD_EARLY_WAIT;
+			// GFXROW word0 = {plane1,plane0} (same content as the GFXW write
+			// above) at ADDR_GFXROW_BASE + idx*4. repack_wr_data_hi_r already
+			// holds plane1 from RP_RD1_WAIT and is untouched since -- only
+			// repack_wr_data_r (plane0) needs re-latching here since it may
+			// have been overwritten by the time we get here (it isn't, but
+			// re-latching from repack_b0 keeps this state self-contained
+			// rather than relying on that fact).
+			RP_WR2_REQ: begin
+				repack_wr_addr_r <= ADDR_GFXROW_BASE[24:0] + {repack_idx, 2'b00};
+				repack_wr_data_r <= repack_b0; // plane0
+				repack_wr_req_r  <= 1'b1;
+				repack_st        <= RP_WR2_WAIT;
+			end
+			RP_WR2_WAIT: if (sdram_wr_ack) begin
+				repack_wr_req_r <= 1'b0;
+				repack_st       <= RP_WR3_REQ;
 			end
 
-			// Wait here for ioctl_index to transition 0->1 (Master ROM
-			// stream finished, Slave ROM's about to start) to steal the
-			// rd2 channel for one quick read of address 0. REGRESSION
-			// FIX: this stage must never be allowed to permanently block
-			// the main scan below it -- confirmed on real hardware that
-			// the assumed clean, immediately-adjacent 0->1 transition
-			// doesn't reliably happen (ROM loading order across all 5
-			// ioctl_index values in the .mra isn't guaranteed to produce
-			// one), which silently stalled the entire scan pipeline
-			// (rd_scan_done never went true, previously-working
-			// diagnostics went dark). Escape hatch: if reset falls (all
-			// loading genuinely finished) before the edge was ever seen,
-			// give up on the early read and proceed to the real scan
-			// anyway, leaving dbg_early_b0 at its reset default.
-			RD_EARLY_WAIT: begin
-				// Gated by ENABLE_MIDLOAD_DIAG_READS: this is the second
-				// of the two mid-download rd2 injections (see parameter
-				// comment). When disabled, park here until loading ends
-				// and proceed straight to the scan, leaving dbg_early_b0
-				// at its reset default.
-				if (ENABLE_MIDLOAD_DIAG_READS && (ioctl_index_prev == 16'h00) && (ioctl_index == 16'h01)) begin
-					sdram_rd2_addr <= 25'd0;
-					sdram_rd2_req  <= 1'b1;
-					rd_phase       <= RD_EARLY_ACK;
-				end else if (loading_done) begin
-					rd_phase <= RD_SCAN;
-				end
+			// GFXROW word1 = {8'h00, plane2} at ADDR_GFXROW_BASE + idx*4 + 2.
+			RP_WR3_REQ: begin
+				repack_wr_addr_r    <= ADDR_GFXROW_BASE[24:0] + {repack_idx, 2'b00} + 25'd2;
+				repack_wr_data_r    <= repack_b2;  // low byte  = plane2
+				repack_wr_data_hi_r <= 8'h00;      // high byte = padding
+				repack_wr_req_r     <= 1'b1;
+				repack_st           <= RP_WR3_WAIT;
 			end
-
-			RD_EARLY_ACK: if (sdram_rd2_ack) begin
-				dbg_early_b0  <= sdram_rd2_data;
-				sdram_rd2_req <= 1'b0;
-				rd_phase      <= RD_SCAN;
-			end else if (loading_done) begin
-				// Same escape hatch in case the ack itself never arrives.
-				sdram_rd2_req <= 1'b0;
-				rd_phase      <= RD_SCAN;
-			end
-
-			RD_SCAN: begin
-				// Kick off the big scan once ALL ROM loading has finished
-				// (loading_done, sticky -- not ioctl_download's edges,
-				// which toggle mid-load between parts/indices). Must also
-				// gate on !rd_scan_active: unlike the one-shot edge this
-				// replaced, loading_done stays high for the rest of time,
-				// so without this the scan would re-trigger and reset
-				// itself back to address 0 every single cycle for as
-				// long as rd_scan_done stays false (i.e. throughout the
-				// entire scan), never able to make progress.
-				if (loading_done && !rd_scan_active && !rd_scan_done) begin
-					rd_scan_active <= 1'b1;
-					rd_scan_addr   <= 18'd0;
-					rd_chk         <= 8'h00;
-					rd_chk_even    <= 8'h00;
-					rd_chk_odd     <= 8'h00;
-					rd_chk_q0      <= 8'h00;
-					rd_chk_q1      <= 8'h00;
-					rd_chk_q2      <= 8'h00;
-					rd_chk_q3      <= 8'h00;
-					rd2_req_pend   <= 1'b0;
-					sdram_rd2_req  <= 1'b0;
-				end
-
-				if (rd_scan_active) begin
-					if (!rd2_req_pend) begin
-						sdram_rd2_addr <= {7'b0, rd_scan_addr};
-						sdram_rd2_req  <= 1'b1;
-						rd2_req_pend   <= 1'b1;
-					end else if (sdram_rd2_ack) begin
-						rd_chk <= rd_chk + sdram_rd2_data;
-						if (sdram_rd2_addr[0]) rd_chk_odd  <= rd_chk_odd  + sdram_rd2_data;
-						else                   rd_chk_even <= rd_chk_even + sdram_rd2_data;
-						case (sdram_rd2_addr[17:16])
-							2'd0: rd_chk_q0 <= rd_chk_q0 + sdram_rd2_data;
-							2'd1: rd_chk_q1 <= rd_chk_q1 + sdram_rd2_data;
-							2'd2: rd_chk_q2 <= rd_chk_q2 + sdram_rd2_data;
-							2'd3: rd_chk_q3 <= rd_chk_q3 + sdram_rd2_data;
-						endcase
-						// Ground-truth spot check: latch the actual first 4
-						// bytes read back from SDRAM at addresses 0-3, so
-						// they can be compared directly against a known ROM
-						// hex dump (e.g. "F3 ED 56 31...") rather than only
-						// having an opaque checksum pass/fail.
-						case (rd_scan_addr)
-							18'd0: dbg_scan_b0 <= sdram_rd2_data;
-							18'd1: dbg_scan_b1 <= sdram_rd2_data;
-							18'd2: dbg_scan_b2 <= sdram_rd2_data;
-							18'd3: dbg_scan_b3 <= sdram_rd2_data;
-						endcase
-						sdram_rd2_req <= 1'b0;
-						rd2_req_pend  <= 1'b0;
-						if (rd_scan_addr == 18'h3FFFF) begin
-							rd_scan_active <= 1'b0;
-							rd_scan_done   <= 1'b1;
-							rd_phase       <= RD_LIVE_IDLE;
-						end else begin
-							rd_scan_addr <= rd_scan_addr + 18'd1;
-						end
-					end
-				end
-			end
-
-			// Live fetch-mismatch counter (docs/sdram_plan.md Section 2):
-			// runs forever once the boot-time scan is done. live_tick
-			// gates the cadence (~1.37ms @ 48MHz); rd2 is lowest arbiter
-			// priority so this never delays a real CPU fetch.
-			RD_LIVE_IDLE: if (live_tick) rd_phase <= RD_LIVE_REQ;
-
-			RD_LIVE_REQ: begin
-				sdram_rd2_addr <= LIVE_ADDR_BASE | {24'd0, live_lane};
-				sdram_rd2_req  <= 1'b1;
-				rd_phase       <= RD_LIVE_WAIT;
-			end
-
-			RD_LIVE_WAIT: if (sdram_rd2_ack) begin
-				sdram_rd2_req <= 1'b0;
-				live_poll_cnt <= live_poll_cnt + 4'd1;
-				if (!live_lane) begin
-					if (!live_ref_lo_set) begin
-						live_ref_lo     <= sdram_rd2_data;
-						live_ref_lo_set <= 1'b1;
-					end else if ((sdram_rd2_data != live_ref_lo) && (live_mm_cnt != 8'hFF)) begin
-						live_mm_cnt <= live_mm_cnt + 8'd1;
-					end
+			RP_WR3_WAIT: if (sdram_wr_ack) begin
+				repack_wr_req_r <= 1'b0;
+				if (repack_idx == REPACK_LEN - 17'd1) begin
+					repack_st   <= RP_DONE;
+					repack_done <= 1'b1;
 				end else begin
-					if (!live_ref_hi_set) begin
-						live_ref_hi     <= sdram_rd2_data;
-						live_ref_hi_set <= 1'b1;
-					end else if ((sdram_rd2_data != live_ref_hi) && (live_mm_cnt != 8'hFF)) begin
-						live_mm_cnt <= live_mm_cnt + 8'd1;
-					end
+					repack_idx  <= repack_idx + 17'd1;
+					repack_st   <= RP_RD0_REQ;
 				end
-				live_lane <= ~live_lane;
-				rd_phase  <= RD_LIVE_IDLE;
 			end
 
-			default: ; // RD_DONE: unused, RD_SCAN stays active/idle forever
+			default: ; // RP_DONE: parked here for the rest of time
 		endcase
 	end
 end
 
-wire dbg_chk_match_q0 = rd_scan_done && (wr_chk_q0 == rd_chk_q0);
-wire dbg_chk_match_q1 = rd_scan_done && (wr_chk_q1 == rd_chk_q1);
-wire dbg_chk_match_q2 = rd_scan_done && (wr_chk_q2 == rd_chk_q2);
-wire dbg_chk_match_q3 = rd_scan_done && (wr_chk_q3 == rd_chk_q3);
-
-wire dbg_chk_match_even = rd_scan_done && (wr_chk_even == rd_chk_even);
-wire dbg_chk_match_odd  = rd_scan_done && (wr_chk_odd  == rd_chk_odd);
-
-wire dbg_chk_match = rd_scan_done && (wr_chk == rd_chk);
-
 //------------------------------------------------------------------
-// Graphics / palette ROMs (still on BRAM — small, fit M10K budget)
-//   0x1C0000-0x1D7FFF: GFX tile ROM    (96 KB)
-//   0x1D8000-0x1F7FFF: palette PROM  (128 KB sparse)
+// WP-L3: per-game EEPROM default-content load. Runs once, after the
+// gfx repack FSM finishes (repack_done), borrowing the same rd2 channel
+// (repack and this FSM are never active at the same time, so this is a
+// simple mutually-exclusive extension of the mux below, same pattern as
+// repack borrowing rd2/wr from sor_video/the ioctl loader). Reads the
+// 128-byte MRA-delivered image at ADDR_EEPROM_BASE (big-endian words,
+// hi byte first, matching sor_eeprom_93c46's eeprom_data[o*2+0]=hi/
+// [o*2+1]=lo convention) and writes all 64 words into the eeprom
+// module's mem[] before the CPUs are released.
 //------------------------------------------------------------------
-// NOTE: these upper bounds must be sized wide enough to hold the full
-// value -- 16'h17FFF and 16'h1FFFF are 16-BIT-sized literals, which can
-// only represent 0-0xFFFF; the literal value gets silently truncated
-// to its low 16 bits (0x17FFF -> 0x7FFF, 0x1FFFF -> 0xFFFF), shrinking
-// gfx_rom from 98304 to 32768 entries and prom_rom from 131072 to
-// 65536. That exactly matches a real symptom: GFX bitplane 0 (address
-// range 0x0000-0x7FFF) stayed inside the truncated bound and read
-// real data; bitplanes 1 and 2 (0x8000-0x17FFF) were out of bounds
-// and always read back X in sim -- and Quartus would synthesize BRAMs
-// sized to the same truncated depth, so this very likely also explains
-// the solid-color/missing-tile-graphics symptom seen on real hardware.
-// 2026-07-12 session (docs/planning.md Step 2): gfx_rom's actual
-// content only needs 98304 entries (0x17FFF), but that's not a power
-// of 2 -- unlike prom_rom's clean 131072 (0x1FFFF), which needs no
-// special handling. Confirmed via the fitted design's RAM Summary
-// report that this is a REAL structural difference, not just a
-// cosmetic one: Quartus's altsyncram inference for gfx_rom required
-// extra auto-generated address-decode/mux logic (decode_pma + mux_9hb)
-// that prom_rom's implementation doesn't have at all, to route between
-// 96 separate physical M10K block instances for the odd-sized array
-// (prom_rom uses a simpler structure across 128 blocks). This is
-// exactly the kind of Quartus-synthesized glue logic that plain RTL
-// behavioral simulation can never exercise -- it doesn't exist until
-// the fitter builds it -- matching the observed pattern precisely:
-// the isolated sim testbench (sim/sor_video_tb.sv) always "worked",
-// while real hardware never once returned real gfx_rom content
-// (confirmed via a live fingerprint diagnostic reading gfx_rom[0x8003]
-// as 0x00 where the ROM file's real content is 0x FF, and a sticky bit
-// confirming zero gfx_rom reads ever returned nonzero, on any screen).
-// Padding the depth to a clean power of 2 (matching prom_rom's own
-// declaration exactly) gives Quartus the same simple case it already
-// handles correctly for prom_rom, eliminating the need for that extra
-// decode/mux logic entirely. Wastes 32KB of M10K (this project has
-// budget: 364/553 M10K blocks used per the last fit report, 66%) in
-// exchange for using the same, already-proven-correct BRAM structure
-// for both arrays. The extra address range (0x18000-0x1FFFF) is never
-// written by ioctl loading and never read by sor_video's tile-fetch
-// address computation, so this is purely a depth-padding change with
-// no other functional effect.
-// ramstyle="no_rw_check" REVERTED (2026-07-12 session): it was added
-// in the exact same commit that restored the prom_rom fingerprint
-// check and first showed prom_rom dead -- meaning no build ever ran
-// with the check present and this attribute absent, so it couldn't be
-// ruled in or out. The backpressure/ioctl_wait theory tested since has
-// been ruled out, so this is the one remaining untested change from
-// tonight. Reverting to isolate it cleanly: if prom_rom comes back
-// correct with this gone, the attribute is the cause; if it's still
-// dead, the bug predates even this and the reference-core research
-// this session's ramstyle change was based on doesn't explain it.
-reg [7:0] gfx_rom  [0:17'h1FFFF];
-reg [7:0] prom_rom [0:17'h1FFFF];
+typedef enum logic [2:0] {
+	EE_IDLE, EE_RD_HI_REQ, EE_RD_HI_WAIT, EE_RD_LO_REQ, EE_RD_LO_WAIT, EE_WR, EE_DONE
+} ee_state_e;
 
-// Uses ioctl_addr_d1 (one-cycle-delayed, declared above near
-// ioctl_wr_rom) rather than the live ioctl_addr -- same hps_io timing
-// skew as the SDRAM ROM writes: ioctl_addr has already advanced to the
-// next byte's address by the time ioctl_wr reads 1 externally. Routed
-// by address range now (single flat download session), not ioctl_index.
-// gfx_rom write+readback self-test (2026-07-12 session): every check
-// this session so far has only ever tested READS of ioctl-loaded ROM
-// content -- gfx_rom's WRITE path (distinct physical BRAM port from
-// prom_rom's, despite the shared always block below) has never been
-// independently verified on real hardware, decoupled from the ioctl
-// download session's own timing/concurrent-traffic characteristics.
-// This writes a known sentinel to SELFTEST_ADDR (17'h1FFFF -- the top
-// of gfx_rom's padded address space, address bits [16:15]=11, a plane
-// value sor_video's fetch FSM can never legitimately produce since
-// fetch_tile_code's plane field only ever takes 00/01/10, so this
-// address is guaranteed both (a) never ioctl-loaded with real content
-// and (b) never organically requested by the video-side read port,
-// eliminating any collision risk) shortly after loading_done, then
-// reads it back through the SAME existing 2 physical ports (write
-// port A gets one more mux'd write-enable source below; read port B
-// briefly has its address overridden -- see the gfx_addr_vid mux
-// below). No third accessor is added on either port, so this can't
-// repeat the earlier Quartus BRAM-inference hang.
-localparam [16:0] GFX_SELFTEST_ADDR    = 17'h1FFFF;
-localparam [7:0]  GFX_SELFTEST_PATTERN = 8'hA5;
-localparam [2:0]  ST_IDLE=0, ST_WAIT=1, ST_WRITE=2, ST_SETTLE=3, ST_READ_ADDR=4, ST_READ_WAIT=5, ST_READ_CAPTURE=6, ST_DONE=7;
-reg [2:0]  selftest_state;
-reg [7:0]  selftest_wait_cnt;
-reg        selftest_wr;
-reg        selftest_addr_override;
-reg [7:0]  gfx_selftest_readback;
-reg        gfx_selftest_done, gfx_selftest_pass;
-reg [16:0] override_addr_r; // drives gfx_addr_vid while selftest_addr_override is set
+ee_state_e ee_st;
+reg  [5:0] ee_idx;
+reg  [7:0] ee_hi;
+reg        ee_done;
 
-// prom_rom self-test (2026-07-13 session, mirrors the gfx pattern
-// above): the opportunistic prom fingerprint is scroll-DEPENDENT --
-// the video fetch only presents address 0x8000 when the game's
-// scroll/gfxbank map a visible tile row there, and on low-scroll
-// screens every fetched address sits in the PROM's empty u70 region,
-// which reads 00 from a perfectly loaded prom_rom. So prom_fp=00 /
-// ever_prom_nonzero=0 cannot distinguish "prom_rom dead" from
-// "prom_rom fine but the scroll registers never move". This forces
-// the question, scroll-independently, right after loading_done:
-//   1. read prom_rom[0x8000] via a brief address override on the
-//      EXISTING video read port (expect 0x69, u69's first byte) --
-//      proves ioctl content + read path;
-//   2. write 0xA5 to 0x1FFFF (u89 empty-socket fill byte, loaded as
-//      00, tile row 0xFF -- never fetched by any real screen) and
-//      read it back -- proves the BRAM ports themselves.
-// Same two-physical-ports discipline as the gfx self-test: one more
-// mux source on each existing port, no third accessor.
-localparam [16:0] PROM_ST_SENTINEL_ADDR = 17'h1FFFF;
-localparam [7:0]  PROM_ST_PATTERN       = 8'hA5;
-localparam [3:0]  PST_IDLE=0, PST_WAIT=1, PST_RD69_ADDR=2, PST_RD69_WAIT=3, PST_RD69_CAP=4,
-                  PST_WRITE=5, PST_SETTLE=6, PST_RD_ADDR=7, PST_RD_WAIT=8, PST_RD_CAP=9, PST_DONE=10;
-reg [3:0]  prom_st_state;
-reg [7:0]  prom_st_wait_cnt;
-reg        prom_st_wr;
-reg        prom_st_override;
-reg [16:0] prom_override_addr;
-reg [7:0]  prom_fp_forced; // prom_rom[0x8000] via forced read, expect 0x69
-reg        prom_st_done, prom_st_pass;
+reg        ee_rd_req_r;
+reg [24:0] ee_rd_addr_r;
+reg        ee_mem_wr_r;
+reg  [5:0] ee_mem_wr_addr_r;
+reg [15:0] ee_mem_wr_data_r;
 
-// Second read port for sor_video's background-tilemap tile fetch
-// (time-multiplexed across the 3 gfx_rom bitplanes by sor_video).
-// gfx_addr_vid is muxed, not a straight wire, so the self-test above
-// can briefly borrow this same physical read port -- still exactly one
-// read port, one address bus, into gfx_rom. Declared here (ahead of the
-// self-test always block that reads gfx_data_vid) to avoid a forward-
-// reference compile error.
-wire [16:0] gfx_addr_from_video, prom_addr_from_video;
-wire [16:0] gfx_addr_vid  = selftest_addr_override ? override_addr_r : gfx_addr_from_video;
-wire [16:0] prom_addr_vid = prom_st_override ? prom_override_addr : prom_addr_from_video;
-reg  [7:0]  gfx_data_vid, prom_data_vid;
+wire ee_active = (ee_st != EE_IDLE) && (ee_st != EE_DONE);
+
 always @(posedge clk_sys) begin
-	gfx_data_vid  <= gfx_rom[gfx_addr_vid];
-	prom_data_vid <= prom_rom[prom_addr_vid];
-end
-
-// gfx_rom write+readback self-test: writes a known sentinel to
-// SELFTEST_ADDR (17'h1FFFF -- top of gfx_rom's padded address space, a
-// plane value sor_video's fetch FSM can never legitimately produce, so
-// guaranteed collision-free) shortly after loading_done, then reads it
-// back through the SAME 2 physical ports (write port A gets one more
-// mux'd write-enable source below; read port B briefly has its address
-// overridden). Passed on hardware (D P A5) -- proves gfx_rom's BRAM
-// interface itself works, decoupled from the ioctl download session.
-// The follow-up checksum-scan/write-hit-counter/range-transit
-// diagnostics that chased *why* real ioctl-loaded content still never
-// lands have all been removed after ruling out several theories
-// (giant sound-ROM fill, gap position) without resolving it -- see
-// docs/SESSION_2026-07-12_SUNDAY_EVENING.md. Freed up for the
-// ramstyle="no_rw_check" experiment and the restored prom_rom
-// fingerprint check below.
-always @(posedge clk_sys) begin
-	selftest_wr            <= 1'b0;
-	selftest_addr_override <= 1'b0;
+	ee_mem_wr_r <= 1'b0;
 	if (sdram_init) begin
-		selftest_state    <= ST_IDLE;
-		gfx_selftest_done <= 1'b0;
-	end else case (selftest_state)
-		ST_IDLE: if (loading_done) begin
-			selftest_wait_cnt <= 8'd8;
-			selftest_state    <= ST_WAIT;
-		end
-		// A few settle cycles after loading_done so this never races the
-		// final real ioctl write landing.
-		ST_WAIT: begin
-			if (selftest_wait_cnt == 8'd0) selftest_state <= ST_WRITE;
-			else selftest_wait_cnt <= selftest_wait_cnt - 8'd1;
-		end
-		ST_WRITE: begin
-			selftest_wr    <= 1'b1;
-			selftest_state <= ST_SETTLE;
-		end
-		ST_SETTLE: selftest_state <= ST_READ_ADDR; // let the write land
-		ST_READ_ADDR: begin
-			override_addr_r         <= GFX_SELFTEST_ADDR;
-			selftest_addr_override <= 1'b1;
-			selftest_state          <= ST_READ_WAIT;
-		end
-		ST_READ_WAIT: begin
-			override_addr_r         <= GFX_SELFTEST_ADDR;
-			selftest_addr_override <= 1'b1; // hold address stable one more cycle for the BRAM's registered output
-			selftest_state          <= ST_READ_CAPTURE;
-		end
-		ST_READ_CAPTURE: begin
-			gfx_selftest_readback <= gfx_data_vid;
-			gfx_selftest_pass     <= (gfx_data_vid == GFX_SELFTEST_PATTERN);
-			gfx_selftest_done     <= 1'b1;
-			selftest_state         <= ST_DONE;
-		end
-		ST_DONE: ; // stays here forever
-	endcase
-end
-
-// prom_rom self-test FSM (see the PROM_ST_* comment above the reg
-// declarations): forced read of prom_rom[0x8000] (expect 0x69,
-// scroll-independent), then a write+readback sentinel at 0x1FFFF.
-//   prom_rom[0x8000] should read 0x69 (03-22102-01.u69's first byte)
-localparam [16:0] PROM_FP_ADDR = 17'h8000;
-always @(posedge clk_sys) begin
-	prom_st_wr       <= 1'b0;
-	prom_st_override <= 1'b0;
-	if (sdram_init) begin
-		prom_st_state <= PST_IDLE;
-		prom_st_done  <= 1'b0;
-	end else case (prom_st_state)
-		PST_IDLE: if (loading_done) begin
-			prom_st_wait_cnt <= 8'd8;
-			prom_st_state    <= PST_WAIT;
-		end
-		PST_WAIT: begin
-			if (prom_st_wait_cnt == 8'd0) prom_st_state <= PST_RD69_ADDR;
-			else prom_st_wait_cnt <= prom_st_wait_cnt - 8'd1;
-		end
-		// Forced read #1: ioctl-loaded content at 0x8000 (expect 69)
-		PST_RD69_ADDR: begin
-			prom_override_addr <= PROM_FP_ADDR;
-			prom_st_override   <= 1'b1;
-			prom_st_state      <= PST_RD69_WAIT;
-		end
-		PST_RD69_WAIT: begin
-			prom_override_addr <= PROM_FP_ADDR;
-			prom_st_override   <= 1'b1; // hold for the registered output
-			prom_st_state      <= PST_RD69_CAP;
-		end
-		PST_RD69_CAP: begin
-			prom_fp_forced <= prom_data_vid;
-			prom_st_state  <= PST_WRITE;
-		end
-		// Write+readback sentinel: proves the ports independent of ioctl
-		PST_WRITE: begin
-			prom_st_wr    <= 1'b1;
-			prom_st_state <= PST_SETTLE;
-		end
-		PST_SETTLE: prom_st_state <= PST_RD_ADDR;
-		PST_RD_ADDR: begin
-			prom_override_addr <= PROM_ST_SENTINEL_ADDR;
-			prom_st_override   <= 1'b1;
-			prom_st_state      <= PST_RD_WAIT;
-		end
-		PST_RD_WAIT: begin
-			prom_override_addr <= PROM_ST_SENTINEL_ADDR;
-			prom_st_override   <= 1'b1;
-			prom_st_state      <= PST_RD_CAP;
-		end
-		PST_RD_CAP: begin
-			prom_st_pass  <= (prom_data_vid == PROM_ST_PATTERN);
-			prom_st_done  <= 1'b1;
-			prom_st_state <= PST_DONE;
-		end
-		PST_DONE: ; // stays here forever
-	endcase
-end
-
-// Download-stream telemetry: closes the 0x0C0000-0x1F8000 diagnostic
-// blind spot. SDRAM-bound bytes end at ADDR_SOUND_LO (0x0C0000) and
-// every existing download check (SDRAM checksums, accept0/1/2 latches)
-// watches only that low region -- nothing has ever observed whether
-// the stream actually REACHES the gfx/prom range (0x1C0000+) on a
-// given boot. The write-hit counter that previously read 0x00000 is
-// plain fabric logic upstream of any BRAM placement, so if it is
-// honest the "dead BRAM" mystery is a dead STREAM: the ARM/HPS side
-// never delivering (or the core never accepting) bytes in that range
-// on bad boots. These make that directly visible, per boot:
-//
-//  - dbg_max_ioctl_addr: running max of ioctl_addr_d1[26:12] over all
-//    accepted index-0 write strobes (4KB resolution). Expected 0x1F7
-//    (flat image ends at 0x1F8000). Anything less = stream truncated.
-//  - gfx/prom_wr_hits: 20-bit counts of the EXACT write conditions
-//    used by the BRAM write block above. Displayed as [19:8], i.e.
-//    256-byte units: expected 0x180 (96KB gfx) and 0x200 (128KB prom).
-//  - dbg_dl_index_last: ioctl_index latched at each download-session
-//    START (rising edge), so a session arriving with an unexpected
-//    index is visible. 0xFF = no session seen yet.
-//  - dbg_dl_end_addr: ioctl_addr_d1[26:12] latched at each download
-//    END (falling edge). If the last session is the ROM (index 0)
-//    expect 0x1F8; if the DIP session (index 254) lands last expect
-//    0x000 with dbg_dl_index_last=0xFE.
-reg [14:0] dbg_max_ioctl_addr;
-reg [19:0] gfx_wr_hits, prom_wr_hits;
-reg [7:0]  dbg_dl_index_last;
-reg [14:0] dbg_dl_end_addr;
-always @(posedge clk_sys) begin
-	if (sdram_init) begin
-		dbg_max_ioctl_addr <= 15'd0;
-		gfx_wr_hits        <= 20'd0;
-		prom_wr_hits       <= 20'd0;
-		dbg_dl_index_last  <= 8'hFF;
-		dbg_dl_end_addr    <= 15'd0;
+		ee_st       <= EE_IDLE;
+		ee_idx      <= 6'd0;
+		ee_done     <= 1'b0;
+		ee_rd_req_r <= 1'b0;
 	end else begin
-		if (ioctl_wr && ioctl_download && (ioctl_index[7:0] == 8'h00)) begin
-			if (ioctl_addr_d1[26:12] > dbg_max_ioctl_addr)
-				dbg_max_ioctl_addr <= ioctl_addr_d1[26:12];
-			if ((ioctl_addr_d1 >= ADDR_GFX_LO) && (ioctl_addr_d1 < ADDR_PROM_LO) &&
-			    (gfx_wr_hits != 20'hFFFFF))
-				gfx_wr_hits <= gfx_wr_hits + 20'd1;
-			if ((ioctl_addr_d1 >= ADDR_PROM_LO) && (ioctl_addr_d1 < ADDR_PROM_HI) &&
-			    (prom_wr_hits != 20'hFFFFF))
-				prom_wr_hits <= prom_wr_hits + 20'd1;
-		end
-		if (ioctl_download && !ioctl_download_r) dbg_dl_index_last <= ioctl_index[7:0];
-		if (!ioctl_download && ioctl_download_r) dbg_dl_end_addr   <= ioctl_addr_d1[26:12];
+		case (ee_st)
+			EE_IDLE: if (repack_done) ee_st <= EE_RD_HI_REQ;
+
+			EE_RD_HI_REQ: begin
+				ee_rd_addr_r <= ADDR_EEPROM_BASE[24:0] + {18'b0, ee_idx, 1'b0};
+				ee_rd_req_r  <= 1'b1;
+				ee_st        <= EE_RD_HI_WAIT;
+			end
+			EE_RD_HI_WAIT: if (sdram_rd2_ack) begin
+				ee_hi       <= sdram_rd2_data;
+				ee_rd_req_r <= 1'b0;
+				ee_st       <= EE_RD_LO_REQ;
+			end
+
+			EE_RD_LO_REQ: begin
+				ee_rd_addr_r <= ADDR_EEPROM_BASE[24:0] + {18'b0, ee_idx, 1'b0} + 25'd1;
+				ee_rd_req_r  <= 1'b1;
+				ee_st        <= EE_RD_LO_WAIT;
+			end
+			EE_RD_LO_WAIT: if (sdram_rd2_ack) begin
+				ee_mem_wr_data_r <= {ee_hi, sdram_rd2_data};
+				// Latch the destination word index HERE, together with the
+				// data, while ee_idx still holds the current word. ee_mem_wr_r
+				// is a registered pulse that only lands the cycle AFTER EE_WR,
+				// by which point EE_WR has already advanced ee_idx to idx+1.
+				// Pairing the pulse with a live `ee_idx` wrote mem[idx+1] <=
+				// data[idx] (whole image shifted up one word; mem[0] never
+				// written, mem[62] clobbered) -- corrupting the EEPROM. Using
+				// this latched, pre-increment index writes mem[idx] <= data[idx].
+				ee_mem_wr_addr_r <= ee_idx;
+				ee_rd_req_r      <= 1'b0;
+				ee_st            <= EE_WR;
+			end
+
+			EE_WR: begin
+				ee_mem_wr_r <= 1'b1;
+				if (ee_idx == 6'd63) begin
+					ee_st   <= EE_DONE;
+					ee_done <= 1'b1;
+				end else begin
+					ee_idx <= ee_idx + 6'd1;
+					ee_st  <= EE_RD_HI_REQ;
+				end
+			end
+
+			default: ; // EE_DONE: parked here for the rest of time
+		endcase
 	end
 end
 
-always @(posedge clk_sys) begin
-	// Same ioctl_index==0 qualifier as the SDRAM ROM write path: other
-	// index values (e.g. 254 = DIP switches) share the ioctl bus and
-	// must never be treated as ROM content.
-	if (ioctl_wr && ioctl_download && (ioctl_index[7:0] == 8'h00)) begin
-		if ((ioctl_addr_d1 >= ADDR_GFX_LO) && (ioctl_addr_d1 < ADDR_PROM_LO))
-			gfx_rom[ioctl_addr_d1 - ADDR_GFX_LO] <= ioctl_data;
-		else if ((ioctl_addr_d1 >= ADDR_PROM_LO) && (ioctl_addr_d1 < ADDR_PROM_HI))
-			prom_rom[ioctl_addr_d1 - ADDR_PROM_LO] <= ioctl_data;
-	end else if (selftest_wr) begin
-		gfx_rom[GFX_SELFTEST_ADDR] <= GFX_SELFTEST_PATTERN;
-	end else if (prom_st_wr) begin
-		// MUST stay inside this else-if chain, exactly like selftest_wr
-		// above. An earlier revision put this write in a separate
-		// trailing `if` -- functionally identical (the pulses can never
-		// coincide: both FSMs gate on loading_done, and prom's write
-		// state is 3+ cycles later than gfx's), but Quartus can't prove
-		// the two write statements exclusive, infers a SECOND write
-		// port on prom_rom, and with the read port that's a third
-		// accessor: BRAM inference fails and quartus_map melts down
-		// trying to build 128KB from logic cells (10+GB, stuck --
-		// the same failure signature as the original third-accessor
-		// incident). One write statement per array per chain, always.
-		// (prom_st_wr never coincides with selftest_wr either -- see
-		// timing note above -- so priority order here is moot.)
-		prom_rom[PROM_ST_SENTINEL_ADDR] <= PROM_ST_PATTERN;
-	end
-end
+wire        eeprom_mem_wr      = ee_mem_wr_r;
+wire  [5:0] eeprom_mem_wr_addr = ee_mem_wr_addr_r;
+wire [15:0] eeprom_mem_wr_data = ee_mem_wr_data_r;
+
+// Final muxes: repack and the EEPROM loader borrow rd2/wr while active
+// (mutually exclusive -- EE_IDLE only advances once repack_done);
+// otherwise the channels behave exactly as before (sor_video's own
+// request / the ioctl loader's own write), unchanged.
+assign sdram_rd2_req  = repack_active ? repack_rd_req_r  : (ee_active ? ee_rd_req_r  : sdram_rd2_req_v);
+assign sdram_rd2_addr = repack_active ? repack_rd_addr_r : (ee_active ? ee_rd_addr_r : sdram_rd2_addr_v);
+
+assign sdram_wr_req      = repack_active ? repack_wr_req_r     : wr_pending;
+assign sdram_wr_addr     = repack_active ? repack_wr_addr_r    : sdram_wr_addr_ioctl;
+assign sdram_wr_data     = repack_active ? repack_wr_data_r    : sdram_wr_data_ioctl;
+assign sdram_wr_data_hi  = repack_active ? repack_wr_data_hi_r : sdram_wr_data_hi_ioctl;
+
+//------------------------------------------------------------------
+// Graphics / palette ROMs -- WP-L2: moved off on-chip BRAM (was the
+// binding M10K utilization constraint) onto SDRAM, at their canonical
+// leland_board_pkg addresses (ADDR_GFX_BASE/ADDR_PROM_BASE). They are
+// loaded through the same wfifo->SDRAM-write pipeline as master/slave/
+// sound now (see wr_gate_hi above) and fetched by sor_video's fetch_ph
+// FSM through the rd2 arbiter channel declared near the top of this
+// file. No BRAM arrays, no dedicated video read port, and no special-
+// cased ioctl write block remain here -- gfx/prom are "just more SDRAM
+// content" from this module's point of view.
+//------------------------------------------------------------------
 
 //------------------------------------------------------------------
 // Video RAM — 128 KB dual-port (Master+Slave VRAM I/O ports write/read
@@ -1974,30 +1555,11 @@ wire  [7:0] wram_din_m,  wram_din_s;
 wire        wram_we_m,   wram_we_s;
 wire  [7:0] wram_dout_m, wram_dout_s;
 
-// Port B is otherwise unused -- repurposed as a read-only debug-scan
-// channel for the freeze investigation: once the stall detector (below)
-// latches, spend a few cycles reading Master WRAM $E712/$E715/$E716 --
-// the suspected list-scan loop's flag byte ($E712) and 16-bit list
-// pointer ($E715-E716, the value under direct suspicion: a bad/stale
-// pointer here would explain an unbounded scan). Skips the $E713-E714
-// rate-limiter counter (lower diagnostic value, row-2 space is tight).
-// Independent of the CPU's own port-A traffic, so this can't perturb
-// the hang itself.
-reg  [11:0] wram_dbg_addr_tbl [0:2];
-initial begin
-	wram_dbg_addr_tbl[0] = 12'h712;
-	wram_dbg_addr_tbl[1] = 12'h715;
-	wram_dbg_addr_tbl[2] = 12'h716;
-end
-reg   [1:0] wram_dump_idx;
-wire [11:0] wram_dbg_addr_b = wram_dbg_addr_tbl[wram_dump_idx];
-wire  [7:0] wram_dbg_dout_b;
-
 sor_dpram #(.ADDR_WIDTH(12), .DATA_WIDTH(8)) wram_m
 (
 	.clk(clk_sys),
 	.addr_a(wram_addr_m), .din_a(wram_din_m), .we_a(wram_we_m), .dout_a(wram_dout_m),
-	.addr_b(wram_dbg_addr_b), .din_b(8'd0), .we_b(1'b0), .dout_b(wram_dbg_dout_b)
+	.addr_b(12'd0), .din_b(8'd0), .we_b(1'b0), .dout_b()
 );
 
 sor_dpram #(.ADDR_WIDTH(12), .DATA_WIDTH(8)) wram_s
@@ -2043,7 +1605,11 @@ sor_eeprom_93c46 eeprom
 	.cs(eeprom_cs),
 	.clk_in(eeprom_clk),
 	.di(eeprom_di),
-	.do_out(eeprom_do)
+	.do_out(eeprom_do),
+
+	.mem_wr(eeprom_mem_wr),
+	.mem_wr_addr(eeprom_mem_wr_addr),
+	.mem_wr_data(eeprom_mem_wr_data)
 );
 
 //------------------------------------------------------------------
@@ -2084,30 +1650,52 @@ wire        master_rom_req;          // from sor_master
 wire [17:0] master_rom_addr_w;       // from sor_master (flat 256 KB offset)
 reg  [7:0]  master_rom_data_r;       // latched SDRAM byte
 
-reg  master_ack_hold;
-always @(posedge clk_sys) begin
-	if (!master_rom_req)
-		master_ack_hold <= 1'b0;
-	else if (sdram_rd0_ack)
-		master_ack_hold <= 1'b1;
-end
+// WP-M7 (docs/planning_sdram_multichannel.md §12): read-only line cache in
+// front of rd0 (master Z80 code fetch) -- replaces the old bare ack_hold
+// wrapper (still visible in git history) with rom_line_cache, which *is*
+// that wrapper plus a cache. See rtl/rom_line_cache.sv's header comment for
+// the design (256 lines x 8 bytes, direct-mapped, sequential single-word
+// refill -- deliberately not using WP-M6 burst yet, see that file).
+wire master_rom_stall;
+// 2026-07-26 sizing, from the MR/MA overlay telemetry this cache now feeds:
+// at the default INDEX_BITS=8 this was 256 lines x 8 bytes = 2KB, DIRECT
+// MAPPED over a 256KB (18-bit) ROM space -- 128 distinct regions aliasing
+// onto every line. Hardware measured a 5.0-5.9% miss rate in gameplay, and
+// because each miss costs a flat ~12 CE_6M ticks (8 single-byte SDRAM reads,
+// see rom_line_cache.sv's fill FSM), master stall tracked MS = 12 x MR to
+// within 5% across a 6x swing in scene load -- i.e. stall is purely miss
+// COUNT, not contention. INDEX_BITS=11 gives 2048 lines (16KB) and drops the
+// aliasing to 16 regions per line; the tag narrows 7->4 bits as the index
+// grows, so the cost is ~141kbit rather than 8x the original.
+rom_line_cache #(
+	.BASE       (leland_board_pkg::ADDR_MASTER_BASE),
+	.ADDR_WIDTH (18),
+	.INDEX_BITS (11)
+) rd0_cache (
+	.clk_sys      (clk_sys),
+	.reset        (sdram_init),
+	.sdram_ready  (sdram_ready),
 
-// Explicit sdram_ready gate on the request itself (not just relying on
-// the controller's own internal mode==MODE_NORMAL check inside its access
-// manager) -- removes any dependence on that internal FSM behavior for
-// correctness here, and guarantees this channel never asserts a request
-// during the init window under any timing corner case.
-assign sdram_rd0_req  = master_rom_req & ~master_ack_hold & sdram_ready;
-assign sdram_rd0_addr = {7'b0, master_rom_addr_w};   // 7+18=25 bits, base=0x000000
-// Explicit ~sdram_ready term here too (matching e.g. gnz's rom_stall
-// convention), even though it's currently redundant with the request
-// gate above (no ack can arrive pre-ready, so stall already stays
-// high) -- removes any dependence on that chain of reasoning holding,
-// belt-and-suspenders against future changes to the ack/request logic.
-wire   master_rom_stall = master_rom_req & (~master_ack_hold | ~sdram_ready);
+	.cpu_req      (master_rom_req),
+	.cpu_addr     (master_rom_addr_w),
+	.cpu_data     (master_rom_data_r),
+	.cpu_stall    (master_rom_stall),
 
-always @(posedge clk_sys)
-	if (sdram_rd0_ack) master_rom_data_r <= sdram_rd0_data;
+	.sd_req       (sdram_rd0_req),
+	.sd_addr      (sdram_rd0_addr),
+	.sd_data      (sdram_rd0_data),
+	.sd_ack       (sdram_rd0_ack),
+
+	// 2026-07-26: wired to the debug overlay at last. rom_line_cache's header
+	// says to "start small, grow only if hit-rate telemetry justifies it" --
+	// this is that telemetry. Hardware shows master stall (MS) scaling 6x
+	// from level 1 (2.4% of CPU cycles) to a heavy level-3 scene (14.9%
+	// peak); since VRAM is on-chip BRAM and cannot contend for SDRAM, the
+	// remaining candidate is this cache missing more often as the master
+	// ranges over more code, so measure it directly rather than infer.
+	.access_pulse (mrom_access_pulse),
+	.hit_pulse    (mrom_hit_pulse)
+);
 
 //------------------------------------------------------------------
 // Master Z80
@@ -2116,65 +1704,6 @@ wire [15:0] vid_addr_m;
 wire        vid_addr_wr_m;
 wire [15:0] scroll_x_m, scroll_y_m;
 wire  [7:0] gfxbank_m;
-
-//------------------------------------------------------------------
-// Debug signals from Master CPU (must precede the sor_master
-// instantiation below, which connects them as output ports — some
-// SystemVerilog tools require declare-before-use even for port
-// connections, which Quartus tolerated).
-//------------------------------------------------------------------
-wire [3:0] dbg_bank;        // Master ROM bank register (from sor_master)
-wire       dbg_cpu_active;  // Master CPU memory-read activity pulse
-wire [15:0] dbg_pc;         // Master CPU PC latched at each opcode fetch
-// Runaway-PC trap: frozen last control-flow transfer before the Master ran
-// off into dead ROM (see sor_master.sv's trap block).
-wire [15:0] dbg_jump_from, dbg_jump_to;
-wire  [2:0] dbg_jump_bank;  // bank_reg latched at the jump_from discontinuity
-wire        dbg_sled_trapped;
-wire [31:0] dbg_snd_cmd_hist; // freeze investigation: 2-deep sound-command {hi,lo} history
-// 2026-07-18, "no sound during gameplay on real hardware" investigation
-// (docs/WP10_PROGRESS.md): pure pass-through taps from sor_sound's own
-// new debug ports, feeding sor_video's status overlay.
-wire        dbg_dac_activity, dbg_dac9_activity;
-wire        dbg_snd_int0_pin;
-wire  [7:0] dbg_snd_intc_request, dbg_snd_intc_in_service;
-wire  [6:0] dbg_snd_intc_ext0_ctrl, dbg_snd_intc_ext1_ctrl;
-wire        dbg_snd_intc_poll_pending;
-wire        dbg_snd_audiocpu_reset_n, dbg_snd_core_bus_activity, dbg_snd_rom_fetch_activity;
-wire [15:0] dbg_snd_core_ip;
-wire        dbg_mvport_stall; // freeze investigation: live level of Master's VRAM-port /WAIT stall
-wire [7:0]  dbg_rom_byte = master_rom_data_r; // last byte fetched from SDRAM (Master ROM)
-wire [7:0]  dbg_io_addr;    // last I/O port address accessed by Master
-wire        dbg_io_rd;      // 1=read, 0=write
-wire        dbg_pc_left_fixed; // sticky: Master PC ever fetched from banked ROM
-wire  [7:0] dbg_irq_cnt;    // saturating count of periodic_int_n (raster IRQ) firings
-wire        dbg_read_gin0, dbg_read_gin1, dbg_mcont_wr; // sticky I/O indicators
-wire        dbg_pc_isr; // sticky: Master PC ever entered 0x0038-0x0066
-
-// Latched status bits for the on-screen overlay (left 4 blocks):
-//   bit 0 (red)  : sdram_ready — SDRAM initialised and ready
-//   bit 1 (green): slave_reset_n released by Master (/MCONT bit 0)
-//   bit 2 (blue) : vp_req_m ever fired — Master issued at least one VRAM port op
-//   bit 3 (white): vram_we ever fired — Slave has written at least one VRAM byte
-reg dbg_ever_cmd;
-reg dbg_ever_vram;
-reg dbg_ever_cram;
-reg dbg_ever_scroll;
-wire dbg_scroll_wr;
-always @(posedge clk_sys) begin
-    if (reset) begin
-        dbg_ever_cmd    <= 1'b0;
-        dbg_ever_vram   <= 1'b0;
-        dbg_ever_cram   <= 1'b0;
-        dbg_ever_scroll <= 1'b0;
-    end else begin
-        if (vp_req_m)    dbg_ever_cmd    <= 1'b1;
-        if (vram_we_cpu) dbg_ever_vram   <= 1'b1;
-        if (cram_we_cpu) dbg_ever_cram   <= 1'b1;
-        if (dbg_scroll_wr) dbg_ever_scroll <= 1'b1;
-    end
-end
-wire [4:0] dbg_status = {dbg_pc_left_fixed, dbg_ever_vram, dbg_ever_cmd, slave_reset_n, sdram_ready};
 
 //------------------------------------------------------------------
 // Phase-locked CPU/video release (2026-07-16, docs/SESSION_2026-07-16.md
@@ -2252,7 +1781,28 @@ reg video_release;
 always @(posedge clk_sys) begin
 	if (reset || sdram_init)
 		video_release <= 1'b0;
-	else if (!video_release && sdram_ready && dl_settled && (ce_z80_cnt == 3'd0))
+	// repack_done added (2026-07-22, wider-reads): sor_video must not
+	// start requesting rd2 until the gfx-repack FSM above has finished
+	// borrowing it, since the repack mux only routes rd2/wr to sor_video/
+	// the ioctl loader when it's inactive -- releasing video any earlier
+	// would let the two collide on the same channel.
+	//
+	// WP-L3: the EEPROM load FSM (ee_st) ALSO borrows rd2, sequenced
+	// right after repack_done, but is deliberately NOT a video_release
+	// gate condition here (unlike repack_done) -- measured in sim at
+	// ~29us total (64 words x ~450ns/word), it's short enough that
+	// blocking the whole boot handshake on it measurably delayed
+	// cpu_release and, on hardware, pushed the 80186 sound board's own
+	// boot handshake past its timeout window (silent audio, confirmed
+	// regression on real hardware 2026-07-24). If sor_video's fetch FSM
+	// happens to request rd2 during that ~29us window while ee_active,
+	// the mux below masks its request out (ee_active ? ee_rd_req_r :
+	// sdram_rd2_req_v) -- a handful of dropped/delayed gfx-fetch acks,
+	// well within the fetch FSM's existing variable-latency/cache-miss
+	// tolerance, not a correctness issue. EEPROM content itself is only
+	// consumed later in boot (checksum/service-mode reads), long after
+	// this negligible window closes.
+	else if (!video_release && sdram_ready && dl_settled && repack_done && (ce_z80_cnt == 3'd0))
 		video_release <= 1'b1;
 end
 
@@ -2355,29 +1905,19 @@ sor_master master
 	.service(service),
 	.free_play(free_play),
 
-	.dbg_bank(dbg_bank),
-	.dbg_cpu_active(dbg_cpu_active),
-	.dbg_pc(dbg_pc),
-	.dbg_io_addr(dbg_io_addr),
-	.dbg_io_rd(dbg_io_rd),
-	.dbg_pc_left_fixed(dbg_pc_left_fixed),
-	.dbg_irq_cnt(dbg_irq_cnt),
-	.dbg_read_gin0_o(dbg_read_gin0),
-	.dbg_read_gin1_o(dbg_read_gin1),
-	.dbg_mcont_wr_o(dbg_mcont_wr),
-	.dbg_scroll_wr_o(dbg_scroll_wr),
-	.dbg_pc_isr_o(dbg_pc_isr),
+	.io_base(io_base_r),
+	.mvram_base(mvram_base_r),
+	.dual_io_window(dual_io_window_r),
+	.in4_port_en(in4_port_en_r),
+	.input_scheme(input_scheme_r),
 
-	.dbg_jump_bank(dbg_jump_bank),
-	.dbg_jump_from(dbg_jump_from),
-	.dbg_jump_to(dbg_jump_to),
-	.dbg_sled_trapped(dbg_sled_trapped),
+	.p1_joy(p1_joy),
+	.p2_joy(p2_joy),
+	.p3_joy(p3_joy),
+	.p4_joy(p4_joy),
 
 	.rom_req  (master_rom_req),
 	.rom_stall(master_rom_stall),
-
-	.dbg_snd_cmd_hist(dbg_snd_cmd_hist),
-	.dbg_mvport_stall(dbg_mvport_stall),
 
 	.sound_ctrl_data(sound_ctrl_data),
 	.sound_ctrl_wr(sound_ctrl_wr),
@@ -2394,30 +1934,37 @@ wire        slave_rom_req;           // from sor_slave
 wire [18:0] slave_rom_addr_w;        // from sor_slave (flat 512 KB offset)
 reg  [7:0]  slave_rom_data_r;        // latched SDRAM byte
 
-// Slave debug taps (Follow-up 6) -- routed straight into sor_video's
-// status row; see sor_slave.sv's port comment for what each one is.
-wire [15:0] dbg_s_pc;
-wire  [3:0] dbg_s_bank_reg;
-wire  [7:0] dbg_s_bank_wr_cnt;
-wire  [3:0] dbg_s_bank_max;
-wire [15:0] dbg_s_vram_wr_cnt;
-wire        dbg_s_banked_read_ever;
+// WP-M7 line cache for rd1 (slave Z80 code fetch) -- see rd0_cache above
+// for the design and rtl/rom_line_cache.sv for the module itself.
+wire slave_rom_stall;
+wire slave_vport_stall; // debug-overlay only, from sor_slave.vport_stall_out
+// Same treatment as rd0_cache above, and this one was worse off: 2KB direct
+// mapped over 512KB is 256 regions aliasing per line. Slave stall (SS) ran
+// 2.7-5.2% with a 7.8% peak on the same captures that drove the master
+// change.
+rom_line_cache #(
+	.BASE       (leland_board_pkg::ADDR_SLAVE_BASE),
+	.ADDR_WIDTH (19),
+	.INDEX_BITS (11)
+) rd1_cache (
+	.clk_sys      (clk_sys),
+	.reset        (sdram_init),
+	.sdram_ready  (sdram_ready),
 
-reg  slave_ack_hold;
-always @(posedge clk_sys) begin
-	if (!slave_rom_req)
-		slave_ack_hold <= 1'b0;
-	else if (sdram_rd1_ack)
-		slave_ack_hold <= 1'b1;
-end
+	.cpu_req      (slave_rom_req),
+	.cpu_addr     (slave_rom_addr_w),
+	.cpu_data     (slave_rom_data_r),
+	.cpu_stall    (slave_rom_stall),
 
-// Explicit sdram_ready gate — see matching comment on sdram_rd0_req above.
-assign sdram_rd1_req  = slave_rom_req & ~slave_ack_hold & sdram_ready;
-assign sdram_rd1_addr = 25'h040000 + {6'b0, slave_rom_addr_w};  // 6+19=25, base=0x040000
-wire   slave_rom_stall = slave_rom_req & (~slave_ack_hold | ~sdram_ready);
+	.sd_req       (sdram_rd1_req),
+	.sd_addr      (sdram_rd1_addr),
+	.sd_data      (sdram_rd1_data),
+	.sd_ack       (sdram_rd1_ack),
 
-always @(posedge clk_sys)
-	if (sdram_rd1_ack) slave_rom_data_r <= sdram_rd1_data;
+	.access_pulse (),
+	.hit_pulse    ()
+);
+
 
 //------------------------------------------------------------------
 // Slave Z80
@@ -2459,12 +2006,7 @@ sor_slave slave
 	.rom_req  (slave_rom_req),
 	.rom_stall(slave_rom_stall),
 
-	.dbg_pc              (dbg_s_pc),
-	.dbg_bank_reg        (dbg_s_bank_reg),
-	.dbg_bank_wr_cnt     (dbg_s_bank_wr_cnt),
-	.dbg_bank_max        (dbg_s_bank_max),
-	.dbg_vram_wr_cnt     (dbg_s_vram_wr_cnt),
-	.dbg_banked_read_ever(dbg_s_banked_read_ever)
+	.vport_stall_out(slave_vport_stall)
 );
 
 //------------------------------------------------------------------
@@ -2476,22 +2018,46 @@ wire        sound_rom_req;
 wire [19:0] sound_rom_addr_w;
 reg   [7:0] sound_rom_data_r;
 
-reg  sound_ack_hold;
-always @(posedge clk_sys) begin
-	if (!sound_rom_req)
-		sound_ack_hold <= 1'b0;
-	else if (sdram_rd3_ack)
-		sound_ack_hold <= 1'b1;
-end
+// WP-M7 line cache for rd3 (80186 sound CPU code fetch) -- see rd0_cache
+// above for the design and rtl/rom_line_cache.sv for the module itself.
+wire sound_rom_stall;
+// Sound (80186) has never been instrumented, so this one is sized on the
+// same reasoning rather than on measurement: 2KB direct mapped over 1MB is
+// 512 regions per line, the worst ratio of the three. Its misses share the
+// same SDRAM, so cutting them reduces pressure on master/slave regardless of
+// whether sound itself is ever stall-bound.
+rom_line_cache #(
+	.BASE       (leland_board_pkg::ADDR_SOUND_BASE),
+	.ADDR_WIDTH (20),
+	.INDEX_BITS (11)
+) rd3_cache (
+	.clk_sys      (clk_sys),
+	.reset        (sdram_init),
+	.sdram_ready  (sdram_ready),
 
-// Explicit sdram_ready gate -- same convention as rd0/rd1 above.
-assign sdram_rd3_req  = sound_rom_req & ~sound_ack_hold & sdram_ready;
-assign sdram_rd3_addr = 25'h0C0000 + {5'b0, sound_rom_addr_w}; // 5+20=25, base=0x0C0000 (MRA layout)
-wire   sound_rom_stall = sound_rom_req & (~sound_ack_hold | ~sdram_ready);
+	.cpu_req      (sound_rom_req),
+	.cpu_addr     (sound_rom_addr_w),
+	.cpu_data     (sound_rom_data_r),
+	.cpu_stall    (sound_rom_stall),
 
-always @(posedge clk_sys)
-	if (sdram_rd3_ack) sound_rom_data_r <= sdram_rd3_data;
+	.sd_req       (sdram_rd3_req),
+	.sd_addr      (sdram_rd3_addr),
+	.sd_data      (sdram_rd3_data),
+	.sd_ack       (sdram_rd3_ack),
 
+	.access_pulse (),
+	.hit_pulse    ()
+);
+
+
+// SIM_NO_SOUND: stub out the 80186 sound core entirely for the fast
+// master/slave-only ModelSim cross-check harness (the s80x86 Core is too
+// large to simulate at practical wall-clock speed under ModelSim; rd1/rd3
+// never request during the boot window under investigation anyway --
+// confirmed via probe, see docs/SESSION_2026-07-23_BOOT_HANG.md point 6).
+// Default (undefined) path is completely unchanged -- synthesis and the
+// normal Verilator harness still instantiate the real core.
+`ifndef SIM_NO_SOUND
 sor_sound sound(
 	.clk_sys(clk_sys),
 	.reset(reset | ~cpu_release),
@@ -2509,114 +2075,75 @@ sor_sound sound(
 	.rom_data(sound_rom_data_r),
 	.rom_stall(sound_rom_stall),
 
-	.audio_out(audio_out),
-
-	.dbg_dac_activity(dbg_dac_activity),
-	.dbg_dac9_activity(dbg_dac9_activity),
-	.dbg_int0_pin(dbg_snd_int0_pin),
-	.dbg_intc_request(dbg_snd_intc_request),
-	.dbg_intc_in_service(dbg_snd_intc_in_service),
-	.dbg_intc_ext0_ctrl(dbg_snd_intc_ext0_ctrl),
-	.dbg_intc_ext1_ctrl(dbg_snd_intc_ext1_ctrl),
-	.dbg_intc_poll_pending(dbg_snd_intc_poll_pending),
-	.dbg_audiocpu_reset_n(dbg_snd_audiocpu_reset_n),
-	.dbg_core_bus_activity(dbg_snd_core_bus_activity),
-	.dbg_rom_fetch_activity(dbg_snd_rom_fetch_activity),
-	.dbg_core_ip(dbg_snd_core_ip)
+	.audio_out(audio_out)
 );
-
-// Stall detector (2026-07-17, freeze investigation): the row-1 live PC
-// field flickers unreadably during the race-freeze bug because the
-// Master keeps fetching in a non-terminating loop rather than halting
-// (see docs/SDRAM_TIMING_INVESTIGATION.md's "PINNED" section and the
-// handed-off investigation for full context). Freezes dbg_pc + the
-// VRAM-port sequencer's state ONCE, the first time dbg_s_vram_wr_cnt
-// (proxy for "the game is still rendering") holds flat for
-// STALL_THRESHOLD cycles -- long enough to clear the ~3.1s legitimate
-// post-race/scoring transition a live MAME trace found (near-zero VRAM
-// writes but not a hang), short enough to catch the real hang (which
-// runs indefinitely until reboot). Latches once (stall_latched gates
-// further writes) so the displayed values are a stable snapshot, not
-// another flicker.
-localparam STALL_THRESHOLD = 30'd384_000_000; // ~8s @ 48MHz
-reg [29:0] stall_timer;
-reg [15:0] stall_vram_ref;
-reg        stall_latched;
-reg [15:0] dbg_stall_pc;
-reg        dbg_stall_mvport;
-reg        dbg_stall_side;
-reg  [2:0] dbg_stall_seq;
-reg  [2:0] dbg_stall_bank; // live bank_reg (dbg_bank[2:0]) at the frozen instant -- resolves
-                            // which of the 7 banked ROM images dbg_stall_pc belongs to
-
-reg         wram_dump_active;
-reg         wram_dump_phase; // 0 = addr_b just changed (dout_b stale, wait) 1 = dout_b valid, capture
-reg   [7:0] dbg_wram_e712, dbg_wram_e715, dbg_wram_e716;
-
-always @(posedge clk_sys) begin
-	if (reset) begin
-		stall_timer      <= 30'd0;
-		stall_vram_ref   <= 16'd0;
-		stall_latched    <= 1'b0;
-		dbg_stall_pc     <= 16'd0;
-		dbg_stall_mvport <= 1'b0;
-		dbg_stall_side   <= 1'b0;
-		dbg_stall_seq    <= 3'd0;
-		dbg_stall_bank   <= 3'd0;
-		wram_dump_idx    <= 2'd0;
-		wram_dump_active <= 1'b0;
-		wram_dump_phase  <= 1'b0;
-		dbg_wram_e712    <= 8'h00;
-		dbg_wram_e715    <= 8'h00;
-		dbg_wram_e716    <= 8'h00;
-	end else begin
-		if (dbg_s_vram_wr_cnt != stall_vram_ref) begin
-			stall_vram_ref <= dbg_s_vram_wr_cnt;
-			stall_timer    <= 30'd0;
-		end else if (stall_timer != STALL_THRESHOLD) begin
-			stall_timer <= stall_timer + 30'd1;
-		end
-		if (!stall_latched && stall_timer == STALL_THRESHOLD) begin
-			stall_latched    <= 1'b1;
-			dbg_stall_pc     <= dbg_pc;
-			dbg_stall_mvport <= dbg_mvport_stall;
-			dbg_stall_side   <= cur_side;
-			dbg_stall_seq    <= seq_state;
-			dbg_stall_bank   <= dbg_bank[2:0];
-			wram_dump_active <= 1'b1;
-			wram_dump_idx    <= 2'd0;
-			wram_dump_phase  <= 1'b0;
-		end else if (wram_dump_active) begin
-			if (!wram_dump_phase) begin
-				// addr_b (wram_dbg_addr_tbl[wram_dump_idx]) just became
-				// stable this cycle -- dout_b is still the PREVIOUS
-				// address's data. Wait one more cycle before capturing.
-				wram_dump_phase <= 1'b1;
-			end else begin
-				case (wram_dump_idx)
-					2'd0: dbg_wram_e712 <= wram_dbg_dout_b;
-					2'd1: dbg_wram_e715 <= wram_dbg_dout_b;
-					2'd2: dbg_wram_e716 <= wram_dbg_dout_b;
-				endcase
-				if (wram_dump_idx == 2'd2) begin
-					wram_dump_active <= 1'b0;
-				end else begin
-					wram_dump_idx   <= wram_dump_idx + 2'd1;
-					wram_dump_phase <= 1'b0;
-				end
-			end
-		end
-	end
-end
+`else
+assign sound_response_data = 8'h00;
+assign sound_rom_req       = 1'b0;
+assign sound_rom_addr_w    = '0;
+assign audio_out           = 16'h0;
+`endif
 
 //------------------------------------------------------------------
 // Video system
 //------------------------------------------------------------------
+// Debug-overlay per-frame event pulses (2026-07-25, Pig Out slow-motion
+// investigation instrumentation, see docs/SESSION_2026-07-24_PIGOUT_
+// INVESTIGATION_HANDOFF.md). All display-only; none feed back into game
+// logic. sor_video.sv owns the actual per-frame accumulate/freeze/render
+// (it already has VBlank locally); this module only forwards the raw
+// one-tick-wide event signals it's in a position to see.
+//
+//   master_stall_tick/slave_stall_tick: CE_6M ticks where that CPU's
+//     wait_n is held low purely by the ROM/SDRAM stall term (rom_req &
+//     rom_stall) -- mirrors rtl/sor_master.sv:260's wait_n formula, ROM
+//     term only. This is SDRAM-controller cost the real board never
+//     pays. It deliberately excludes the VRAM-mailbox stall term (see
+//     slave_port_stall_tick below) -- the two are counted separately
+//     because only the ROM term is purely our cost; the real board pays
+//     a VRAM-port wait too.
+//   slave_port_stall_tick: CE_6M ticks where the slave is held in /WAIT
+//     by its own VRAM port (vport_stall), regardless of ROM stall.
+//     NOT purely our cost -- real hardware/MAME also blocks the slave
+//     here (see sor_vram_port.sv's vp_stall comment) -- included for
+//     comparison, not as a bug indicator on its own.
+//   slave_vram_write_tick: one pulse per completed slave-side VRAM port
+//     WRITE op (vp_pop_s with vp_rd_s low). This is a proxy for "how
+//     much drawing work the slave is doing this frame", not a byte
+//     count -- ops 1/2 (see sor_vram_port.sv header) each perform two
+//     physical byte writes but are counted once here, at op-completion
+//     granularity, which is what's cheaply visible at this port.
+//   rd2_grant_tick: one pulse per SDRAM arbitration cycle admitting a
+//     rd2 (video gfx) transaction (sel_rd2 above, already exactly
+//     one-cycle-wide by construction of the accept FSM).
+wire master_stall_tick      = CE_6M && master_rom_req && master_rom_stall;
+wire slave_stall_tick       = CE_6M && slave_rom_req  && slave_rom_stall;
+wire slave_port_stall_tick  = CE_6M && slave_vport_stall;
+wire slave_vram_write_tick  = vp_pop_s && !vp_rd_s;
+wire rd2_grant_tick         = sel_rd2;
+//   mrom_access_tick / mrom_miss_tick: master ROM line-cache completions and
+//     the subset that missed (rd0_cache above). Every miss is a real SDRAM
+//     round-trip contending with the video rd2 stream, so miss COUNT is the
+//     volume term and MS/miss is the contention term -- the two things the
+//     stall percentage alone cannot separate.
+wire mrom_access_pulse, mrom_hit_pulse;
+wire mrom_access_tick       = mrom_access_pulse;
+wire mrom_miss_tick         = mrom_access_pulse && !mrom_hit_pulse;
+
 sor_video video
 (
 	.clk_sys(clk_sys),
 	.reset(reset | ~video_release), // phase-locked video release -- see video_release/cpu_release above
 	.ce_pix(ce_pix),
+
+	.show_overlay          (show_overlay),
+	.master_stall_tick     (master_stall_tick),
+	.slave_stall_tick      (slave_stall_tick),
+	.slave_port_stall_tick (slave_port_stall_tick),
+	.slave_vram_write_tick (slave_vram_write_tick),
+	.rd2_grant_tick        (rd2_grant_tick),
+	.mrom_access_tick      (mrom_access_tick),
+	.mrom_miss_tick        (mrom_miss_tick),
 
 	.HBlank(HBlank),
 	.HSync(HSync),
@@ -2635,108 +2162,16 @@ sor_video video
 	.scroll_y(scroll_y_m),
 	.gfxbank(gfxbank_m),
 
-	.gfx_addr(gfx_addr_from_video),
-	.gfx_data(gfx_data_vid),
-	.prom_addr(prom_addr_from_video),
-	.prom_data(prom_data_vid),
+	.sdram_rd2_req  (sdram_rd2_req_v),
+	.sdram_rd2_ack  (sdram_rd2_ack),
+	.sdram_rd2_addr (sdram_rd2_addr_v),
+	.sdram_rd2_data (sdram_rd2_data),
+	.sdram_rd2_data16(sdram_rd2_data16),
+	.sdram_rd2_data16_hi(sdram_rd2_data16_hi),
+	.fetch_busy     (rd2_fetch_busy),
+	.rbuf_count_out (rd2_rbuf_count),
 
-	.raster_line(raster_line),
-
-	.dbg_bank(dbg_status),
-	.dbg_cpu_active(dbg_cpu_active),
-	.dbg_pc(dbg_pc),
-	.dbg_irq_cnt(dbg_irq_cnt),
-	.dbg_read_gin0(dbg_read_gin0),
-	.dbg_read_gin1(dbg_read_gin1),
-	.dbg_mcont_wr(dbg_mcont_wr),
-	.dbg_ever_cram(dbg_ever_cram),
-	.dbg_ever_scroll(dbg_ever_scroll),
-	.dbg_ever_vram(dbg_ever_vram),
-	.dbg_pc_isr(dbg_pc_isr),
-	.dbg_rom_byte(dbg_rom_byte),
-	.dbg_io_addr(dbg_io_addr),
-	.dbg_io_rd(dbg_io_rd),
-
-	.dbg_wr_chk(wr_chk),
-	.dbg_rd_chk(rd_chk),
-	.dbg_chk_done(rd_scan_done),
-	.dbg_chk_match(dbg_chk_match),
-
-	.dbg_wr_chk_even(wr_chk_even),
-	.dbg_rd_chk_even(rd_chk_even),
-	.dbg_chk_match_even(dbg_chk_match_even),
-	.dbg_wr_chk_odd(wr_chk_odd),
-	.dbg_rd_chk_odd(rd_chk_odd),
-	.dbg_chk_match_odd(dbg_chk_match_odd),
-
-	.dbg_chk_match_q({dbg_chk_match_q3, dbg_chk_match_q2, dbg_chk_match_q1, dbg_chk_match_q0}),
-	.dbg_chk_done_q(rd_scan_done),
-
-	.dbg_bt_done(bt_done),
-	.dbg_bt_pass(bt_pass),
-	.dbg_bt_readback(bt_readback),
-	.dbg_bt_readback2(bt_readback2),
-
-	.dbg_scan_b0(dbg_scan_b0),
-	.dbg_scan_b1(dbg_scan_b1),
-	.dbg_scan_b2(dbg_scan_b2),
-	.dbg_scan_b3(dbg_scan_b3),
-
-	// Repurposed row: slot0=accept0 hit count, slot1=accept0 data
-	// (0xF3 expected). Skew theory A/B check answered (0x00 -- theory
-	// disproven) and retired; slots 2/3 now mirror the same probe
-	// applied to address 1 instead: slot2=accept1 hit count,
-	// slot3=accept1 data (0xED expected).
-	.dbg_wr_b0(dbg_accept0_cnt),
-	.dbg_wr_b1(dbg_accept0_data),
-	.dbg_wr_b2(dbg_accept1_cnt),
-	.dbg_wr_b3(dbg_accept1_data),
-
-	.dbg_early_b0(dbg_early_b0),
-	.dbg_immediate_b0(dbg_immediate_b0),
-	.dbg_rd2_ack_cnt(dbg_rd2_ack_cnt),
-	.dbg_accept2_raw_addr(dbg_accept2_raw_addr),
-	.dbg_accept2_data(dbg_accept2_data),
-	.dbg_dl_sessions(dbg_dl_sessions),
-
-	.dbg_s_pc(dbg_s_pc),
-	.dbg_s_bank_reg(dbg_s_bank_reg),
-	.dbg_s_bank_wr_cnt(dbg_s_bank_wr_cnt),
-	.dbg_s_bank_max(dbg_s_bank_max),
-	.dbg_s_vram_wr_cnt(dbg_s_vram_wr_cnt),
-	.dbg_s_banked_read_ever(dbg_s_banked_read_ever),
-
-	.dbg_snd_cmd_hist(dbg_snd_cmd_hist),
-	.dbg_dac_activity(dbg_dac_activity),
-	.dbg_dac9_activity(dbg_dac9_activity),
-	.dbg_snd_int0_pin(dbg_snd_int0_pin),
-	.dbg_snd_intc_request(dbg_snd_intc_request),
-	.dbg_snd_intc_in_service(dbg_snd_intc_in_service),
-	.dbg_snd_intc_ext0_ctrl(dbg_snd_intc_ext0_ctrl),
-	.dbg_snd_intc_ext1_ctrl(dbg_snd_intc_ext1_ctrl),
-	.dbg_snd_intc_poll_pending(dbg_snd_intc_poll_pending),
-	.dbg_snd_audiocpu_reset_n(dbg_snd_audiocpu_reset_n),
-	.dbg_snd_core_bus_activity(dbg_snd_core_bus_activity),
-	.dbg_snd_rom_fetch_activity(dbg_snd_rom_fetch_activity),
-	.dbg_snd_core_ip(dbg_snd_core_ip),
-	.dbg_jump_from(dbg_jump_from),
-	.dbg_jump_to(dbg_jump_to),
-	.dbg_sled_trapped(dbg_sled_trapped),
-
-	// Master bank register at the trap-latched jump (2026-07-16,
-	// docs/SESSION_2026-07-16.md section 8d): resolves which of the 7
-	// banked-ROM images a banked jump_from/jump_to PC actually belongs
-	// to -- without it a banked PC is ambiguous across 7 different ROM
-	// addresses. This is sor_master's jump_bank_r, latched together with
-	// jump_from at each discontinuity, NOT the live bank_reg (which may
-	// have changed by the time the frozen row is photographed; the live
-	// value is already shown on status row 1).
-	.dbg_m_bank_reg(dbg_jump_bank),
-	.dbg_live_mm({live_mm_cnt, live_poll_cnt}),
-	.dbg_stall_pc(dbg_stall_pc),
-	.dbg_stall_flags({dbg_stall_mvport, dbg_stall_side, dbg_stall_seq}),
-	.dbg_stall_bank(dbg_stall_bank),
-	.dbg_wram_dump({dbg_wram_e712, dbg_wram_e715, dbg_wram_e716})
+	.raster_line(raster_line)
 );
 
 endmodule

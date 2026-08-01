@@ -31,6 +31,8 @@
 //      4 → 0x20000   5 → 0x28000   6 → 0x30000   7 → 0x38000
 //============================================================================
 
+import leland_board_pkg::*;
+
 module sor_master
 (
 	input         clk_sys,
@@ -123,8 +125,7 @@ module sor_master
 	// design shares one physical clk_sys domain; leland_sound_board.sv
 	// registers response_data synchronously on that same clock, so it's
 	// already glitch-free by construction, same as every other
-	// board-level status signal already wired this way (e.g.
-	// dbg_snd_cmd_hist).
+	// board-level status signal already wired this way.
 	input  [7:0]  response_data,
 
 	// Video address latch (triggers Slave sprite blit, Chunk 3)
@@ -200,43 +201,30 @@ module sor_master
 	input         service,
 	input         free_play,
 
-	// Debug — visible in on-screen overlay (no IO board needed)
-	output [3:0]  dbg_bank,       // current ROM bank register value
-	output        dbg_cpu_active, // pulses high each Z80 memory-read cycle
-	output [15:0] dbg_pc,          // latched PC at each opcode fetch (M1)
-	output  [7:0] dbg_io_addr,     // latched low byte of last I/O address accessed
-	output        dbg_io_rd,       // 1 = last I/O access was a read, 0 = write
-	output        dbg_pc_left_fixed, // sticky: PC ever fetched from banked ROM (>=0x2000)
-	output  [7:0] dbg_irq_cnt,     // saturating count of periodic_int_n firings
-	output        dbg_read_gin0_o,  // sticky: Master ever read GIN0 (0x00/0xC0/0x80)
-	output        dbg_read_gin1_o,  // sticky: Master ever read GIN1 (0x01/0xC1/0x81, coin/halt)
-	output        dbg_mcont_wr_o,   // sticky: Master ever WROTE MCONT (slave release)
-	output        dbg_scroll_wr_o,  // pulses when Master writes any scroll register
-	output        dbg_pc_isr_o,     // sticky: Master PC ever entered 0x0038-0x0066
-	                                // (the RST-38h interrupt-driven region found in
-	                                // sim once the sound response_r fix was applied --
-	                                // a static-photo-friendly way to confirm real
-	                                // hardware reaches the same region without
-	                                // needing to capture the fast-moving live PC row)
+	// WP-L3: per-game I/O port base parameterization (leland_board_pkg::
+	// game_cfg, driven by the MRA header's game_id). io_base/mvram_base
+	// are the leland_master_input_r/output_w and leland_mvram_port_r/w
+	// window bases (MAME init_master_ports(mvram_base, io_base)).
+	// dual_io_window reproduces offroad's real double-install call
+	// (init_master_ports called twice, at base and base^0x40) --
+	// offroadt/pigout each use a single window and leave this deasserted.
+	// in4_port_en gates the pigout-only fixed IN4 @ raw 0x7F
+	// (install_read_port, outside the io_base window). input_scheme
+	// selects GIN0-3 bit content.
+	input   [7:0] io_base,
+	input   [7:0] mvram_base,
+	input         dual_io_window,
+	input         in4_port_en,
+	input  leland_board_pkg::input_scheme_e input_scheme,
 
-	// Runaway-PC trap (see the block near dbg_pc_r below). Frozen on
-	// detect: the last control-flow transfer before the Master ran off
-	// into dead ROM -- i.e. the instruction that caused the crash.
-	output [2:0]  dbg_jump_bank,  // bank_reg latched at the jump_from discontinuity
-	output [15:0] dbg_jump_from,
-	output [15:0] dbg_jump_to,
-	output        dbg_sled_trapped,
+	// WP-L3: 4-player digital joystick (JOY4_DIGITAL only); bit layout:
+	// [0]=right [1]=left [2]=down [3]=up [4]=btn1 [5]=btn2 [6]=start
+	// [7]=coin.
+	input   [7:0] p1_joy, p2_joy, p3_joy, p4_joy,
 
 	// SDRAM stall: level-high during ROM read; stall when not ready
 	output        rom_req,    // high during any ROM read machine cycle
-	input         rom_stall,  // high = SDRAM not ready; insert wait states
-
-	// Sound-command history (freeze investigation, see cmd_hist_* comment
-	// near mcont_r below): {hi0,lo0,hi1,lo1}, 2 deep, most recent last.
-	output [31:0] dbg_snd_cmd_hist,
-	// Live level of the VRAM-port /WAIT stall (freeze investigation --
-	// see sor_board.sv's stall-detector comment).
-	output        dbg_mvport_stall
+	input         rom_stall  // high = SDRAM not ready; insert wait states
 );
 
 //------------------------------------------------------------------
@@ -269,7 +257,15 @@ tv80s_ce #(.Mode(0), .T2Write(1), .IOWait(1)) master_cpu
 	.reset_n(~reset),
 	.clk    (clk_sys),
 	.cen    (CE_6M),
+`ifdef NO_STALL_CONTROL
+	// Measurement-only control knob (docs/SESSION_2026-07-24_..._HANDOFF.md):
+	// neutralize the ROM-fetch stall term so the master Z80 never waits on
+	// rom_stall, isolating how much wall-clock progress SDRAM contention
+	// costs. Absent this define, behavior is bit-identical to before.
+	.wait_n (~mvport_stall),
+`else
 	.wait_n (~((rom_req & rom_stall) | mvport_stall)),
+`endif
 	.int_n  (int_n_final),
 	.nmi_n  (1'b1),
 	.busrq_n(1'b1),
@@ -310,25 +306,6 @@ end
 // CPUs only communicate through the shared VRAM mailbox and the
 // SLAVEHALT/GIN1 poll).
 assign int_n_final = periodic_int_n;
-
-// Diagnostic: saturating count of periodic_int_n firings (raster-line
-// interrupt, once per 16 lines). Purely a rate measurement -- doesn't
-// tell us whether the CPU actually services each one (could be masked
-// by DI), just whether the trigger condition itself is firing at a
-// sane rate. Added to investigate a reported "picture rolls
-// continuously, stops in service mode" symptom: this era of hardware
-// commonly uses a raster interrupt to drive per-scanline scroll
-// effects, so if this fires at the wrong rate (or not at all), a
-// scroll-driving ISR reacting to it would misbehave exactly like that.
-reg [7:0] irq_fire_cnt;
-reg       periodic_int_n_prev;
-always @(posedge clk_sys) begin
-	periodic_int_n_prev <= periodic_int_n;
-	if (reset) irq_fire_cnt <= 8'd0;
-	else if (periodic_int_n_prev && !periodic_int_n && (irq_fire_cnt != 8'hFF))
-		irq_fire_cnt <= irq_fire_cnt + 8'd1;
-end
-assign dbg_irq_cnt = irq_fire_cnt;
 
 //------------------------------------------------------------------
 // ROM banking — validated against MAME offroad_bankswitch()
@@ -505,12 +482,17 @@ assign vid_addr_wr = vid_addr_wr_r;
 wire io_rd = ~iorq_n & ~rd_n;
 wire io_wr = ~iorq_n & ~wr_n;
 
-// Real leland_mvram_port_r/w range (mvram_base=0x00, mirrored at
-// 0x40-0x5F); declared here, before first use below, so tools that
-// don't tolerate forward references to implicit nets (ModelSim) don't
-// choke on a later explicit `wire io_mvram = ...` colliding with an
+// WP-L3: leland_mvram_port_r/w range, parameterized by mvram_base
+// (MAME init_master_ports(mvram_base, io_base)). offroad's real driver
+// call installs this handler TWICE (mvram_base=0x00 and 0x40, dual_io_
+// window asserted); offroadt/pigout each install it once at their own
+// base. Declared here, before first use below, so tools that don't
+// tolerate forward references to implicit nets (ModelSim) don't choke
+// on a later explicit `wire io_mvram = ...` colliding with an
 // implicitly-inferred one.
-wire io_mvram = (cpu_addr[7] == 1'b0) && (cpu_addr[5] == 1'b0); // I/O 0x00-0x1F, 0x40-0x5F
+wire [7:0] mvram_base_alt = mvram_base ^ 8'h40;
+wire io_mvram = (cpu_addr[7:5] == mvram_base[7:5]) ||
+                (dual_io_window && (cpu_addr[7:5] == mvram_base_alt[7:5]));
 
 //------------------------------------------------------------------
 // VRAM I/O port (leland_mvram_port_r/w). TRANS_EN=0: the Master is
@@ -568,24 +550,35 @@ wire io_bank  = (cpu_addr[7:0] == 8'hF0);   // bank register write (static map e
 wire io_adc1  = (cpu_addr[7:0] == 8'hFD);   // P1 pedal, raw (MAME port 0xFD)
 wire io_adc2  = (cpu_addr[7:0] == 8'hFE);   // P2 pedal, raw
 wire io_adc3  = (cpu_addr[7:0] == 8'hFF);   // P3 pedal, raw
-// Real wheel ports (MAME redline_state::init_offroad): dedicated, fixed
-// dial-encoded reads, entirely separate from the pedal ports above --
-// offroad_wheel_1_r=0xF9 (P1), offroad_wheel_2_r=0xFB (P2),
-// offroad_wheel_3_r=0xF8 (P3).
+// Real wheel ports (MAME redline_state::init_offroad/init_offroadt):
+// dedicated, fixed dial-encoded reads, entirely separate from the pedal
+// ports above -- offroad_wheel_1_r=0xF9 (P1), offroad_wheel_2_r=0xFB (P2),
+// offroad_wheel_3_r=0xF8 (P3). Fixed for both wheel-scheme games
+// (offroad/offroadt); unused/unconsumed for JOY4_DIGITAL (pigout).
 wire io_wheel1 = (cpu_addr[7:0] == 8'hF9);  // P1 wheel (offroad_wheel_1_r)
 wire io_wheel2 = (cpu_addr[7:0] == 8'hFB);  // P2 wheel (offroad_wheel_2_r)
 wire io_wheel3 = (cpu_addr[7:0] == 8'hF8);  // P3 wheel (offroad_wheel_3_r)
-// Raw 0x00-0x1F is the real leland_mvram_port_r/w range (mvram_base=0x00,
-// mirrored at 0x40-0x5F); the dynamic GIN/MCONT handlers only live at the
-// io_base-relocated addresses (0xC0/0x80), never at their raw offsets --
-// aliasing the raw offsets as well was a boot-compatibility hack that
-// collided with the real VRAM port address space and has been removed.
-wire io_mcont = (cpu_addr[7:0] == 8'hC9) || (cpu_addr[7:0] == 8'h89);
-// AY8910 register-select (/OGIA, raw 0x0A) and data (/OGID, raw 0x0B)
-// writes -- see gfxbank output declaration above for why these matter
-// despite no audio synthesis being implemented.
-wire io_ay_addr = (cpu_addr[7:0] == 8'hCA) || (cpu_addr[7:0] == 8'h8A);
-wire io_ay_data = (cpu_addr[7:0] == 8'hCB) || (cpu_addr[7:0] == 8'h8B);
+
+// WP-L3: the dynamically-relocated leland_master_input_r/output_w window
+// (GIN0/1/3, mcont, ay, scroll) is now parameterized by io_base (MAME
+// init_master_ports(mvram_base, io_base)) instead of offroad's hardcoded
+// 0xC0/0x80. dual_io_window reproduces offroad's real double-install
+// (base and base^0x40); offroadt/pigout install once at their own single
+// base. Offsets within the window (0x00/0x01 GIN0/1, 0x09 mcont, 0x0A/0x0B
+// ay, 0x0C-0x0F scroll, 0x11 GIN3) are fixed by leland_master_input_r/
+// output_w itself and identical across all three games.
+wire [7:0] io_base_alt = io_base ^ 8'h40;
+function automatic io_win(input [7:0] offset);
+	io_win = (cpu_addr[7:0] == (io_base + offset)) ||
+	         (dual_io_window && (cpu_addr[7:0] == (io_base_alt + offset)));
+endfunction
+
+wire io_mcont = io_win(8'h09);
+// AY8910 register-select (/OGIA, offset 0x0A) and data (/OGID, offset
+// 0x0B) writes -- see gfxbank output declaration above for why these
+// matter despite no audio synthesis being implemented.
+wire io_ay_addr = io_win(8'h0A);
+wire io_ay_data = io_win(8'h0B);
 // Real MAME master_redline_map_io (leland.cpp): 0xF2 = 80186 sound CPU
 // response_r/command_lo_w, 0xF4 = command_hi_w (write-only). Neither is
 // a palette register -- offroad has no palette-bank register at all;
@@ -599,11 +592,11 @@ wire io_cmd   = (cpu_addr[7:0] == 8'hF2);   // sound command_lo_w / response_r
 wire io_snd_hi = (cpu_addr[7:0] == 8'hF4);  // sound command_hi_w (write-only)
 
 // Background scroll registers (MAME scroll_w, offset 0x0C-0x0F relative
-// to io_base 0xC0/0x80 for offroad — see leland.cpp init_offroad()).
-wire io_scroll_xlo = (cpu_addr[7:0] == 8'h8C) || (cpu_addr[7:0] == 8'hCC);
-wire io_scroll_xhi = (cpu_addr[7:0] == 8'h8D) || (cpu_addr[7:0] == 8'hCD);
-wire io_scroll_ylo = (cpu_addr[7:0] == 8'h8E) || (cpu_addr[7:0] == 8'hCE);
-wire io_scroll_yhi = (cpu_addr[7:0] == 8'h8F) || (cpu_addr[7:0] == 8'hCF);
+// to io_base -- see leland.cpp init_offroad()/init_offroadt()/init_pigout()).
+wire io_scroll_xlo = io_win(8'h0C);
+wire io_scroll_xhi = io_win(8'h0D);
+wire io_scroll_ylo = io_win(8'h0E);
+wire io_scroll_yhi = io_win(8'h0F);
 
 // Wheel dial encoder — MAME leland_m.cpp dial_compute_value(), reproduced
 // exactly: each read reports the direction (bit7) and magnitude (bits4:0,
@@ -656,45 +649,103 @@ always @(posedge clk_sys) begin
 	end
 end
 
-// GIN input ports — validated against MAME offroad INPUT_PORTS and
-// leland_master_input_r (leland_m.cpp). Also dynamically relocated
-// (see comment above) -- alias raw + both io_base offsets.
-// GIN0 (port 0x00): nitro buttons, active-low (0=pressed)
-//   bit4=P1BTN1, bit5=P2BTN1, bit6=P3BTN1; other bits float high
-wire io_gin0  = (cpu_addr[7:0] == 8'hC0) || (cpu_addr[7:0] == 8'h80);
-wire [7:0] gin0_data = {1'b1,
-                        ~p3_btn[1],  // bit6: P3 nitro
-                        ~p2_btn[1],  // bit5: P2 nitro
-                        ~p1_btn[1],  // bit4: P1 nitro
-                        4'hF};
+// GIN input ports — validated against MAME INPUT_PORTS and
+// leland_master_input_r (leland_m.cpp), parameterized by io_base (see
+// io_win() above). GIN0/1 sit at io_base+0/+1, GIN3 at io_base+0x11.
+wire io_gin0  = io_win(8'h00);
+wire io_gin1  = io_win(8'h01);
+wire io_gin3  = io_win(8'h11);
 
-// GIN1 (port 0x01): slave HALT (bit0 active-low), coin inputs (bits1-3 active-low)
-//   bit0: SLAVEHALT — 0=halted, 1=running (directly from Slave halt_n)
-//   bit1: COIN3 (P3), bit2: COIN2 (P2), bit3: COIN1 (P1) -- matches MAME
-//   offroad INPUT_PORTS IN1 exactly (order is NOT P1/P2/P3)
-wire io_gin1  = (cpu_addr[7:0] == 8'hC1) || (cpu_addr[7:0] == 8'h81);
-// MAME offroad INPUT_PORTS IN1 (0xC1): bit1=COIN3, bit2=COIN2, bit3=COIN1
-wire [7:0] gin1_data = {4'hF,
-                        ~p1_btn[3],  // bit3: coin P1
-                        ~p2_btn[3],  // bit2: coin P2
-                        ~p3_btn[3],  // bit1: coin P3
+// WHEELS3_PEDALS3 (offroad/offroadt) GIN0: nitro buttons, active-low
+// (0=pressed). bit4=P1BTN1, bit5=P2BTN1, bit6=P3BTN1; other bits float high.
+wire [7:0] gin0_wheels = {1'b1,
+                          ~p3_btn[1],  // bit6: P3 nitro
+                          ~p2_btn[1],  // bit5: P2 nitro
+                          ~p1_btn[1],  // bit4: P1 nitro
+                          4'hF};
+
+// WHEELS3_PEDALS3 GIN1: slave HALT (bit0 active-low), coin inputs
+// (bits1-3 active-low). bit1=COIN3, bit2=COIN2, bit3=COIN1 (MAME offroad
+// INPUT_PORTS IN1 order is NOT P1/P2/P3).
+wire [7:0] gin1_wheels = {4'hF,
+                          ~p1_btn[3],  // bit3: coin P1
+                          ~p2_btn[3],  // bit2: coin P2
+                          ~p3_btn[3],  // bit1: coin P3
+                          slave_halt_n}; // bit0: SLAVEHALT
+
+// JOY4_DIGITAL (pigout) GIN0 (leland.cpp INPUT_PORTS_START(pigout), IN0 @
+// io_base+0): bit1=P3BTN2, bit2=P3right, bit3=P3down, bit5=P2BTN2,
+// bit6=P2left, bit7=P2up. p*_joy bit layout: [0]=right [1]=left [2]=down
+// [3]=up [4]=btn1 [5]=btn2 [6]=start [7]=coin.
+// All bits below are active-low on the real bus (0=pressed); p*_joy from
+// MiSTer is active-high (1=pressed), hence the ~ on every mapped bit.
+wire [7:0] gin0_joy4 = {~p2_joy[3],  // bit7: P2 up
+                        ~p2_joy[1],  // bit6: P2 left
+                        ~p2_joy[5],  // bit5: P2 btn2
+                        1'b1,        // bit4: unused
+                        ~p3_joy[2],  // bit3: P3 down
+                        ~p3_joy[0],  // bit2: P3 right
+                        ~p3_joy[5],  // bit1: P3 btn2
+                        1'b1};       // bit0: unused
+
+// JOY4_DIGITAL GIN1 (pigout IN1 @ io_base+1): bit0=SLAVEHALT, bit1=COIN1,
+// bit3=COIN2 (bit2 read but never referenced by the real game).
+wire [7:0] gin1_joy4 = {4'hF,
+                        ~p2_joy[7],  // bit3: coin P2
+                        1'b1,        // bit2: unreferenced
+                        ~p1_joy[7],  // bit1: coin P1
                         slave_halt_n}; // bit0: SLAVEHALT
 
-// GIN3 (port 0x11): EEPROM DO (bit0), VBlank (bit1), service (bit3)
-wire io_gin3  = (cpu_addr[7:0] == 8'hD1) || (cpu_addr[7:0] == 8'h91);
-wire [7:0] gin3_data = {4'hF,
-                        ~service,    // bit3: service (active-low)
-                        1'b1,        // bit2: unused, float high
-                        ~vblank,     // bit1: VBlank (active-low per Leland convention)
-                        eeprom_do};  // bit0: real 93C46 DO (sor_eeprom_93c46)
+wire [7:0] gin0_data = (input_scheme == JOY4_DIGITAL) ? gin0_joy4 : gin0_wheels;
+wire [7:0] gin1_data = (input_scheme == JOY4_DIGITAL) ? gin1_joy4 : gin1_wheels;
+
+// GIN2 (io_base+0x10, JOY4_DIGITAL only -- pigout IN2): bit0=START3,
+// bit1=P3BTN1, bit2=P3left, bit3=P3up, bit4=START2, bit5=P2BTN1,
+// bit6=P2right, bit7=P2down. Unused for WHEELS3_PEDALS3 (never read).
+wire io_gin2 = io_win(8'h10);
+wire [7:0] gin2_data = {~p2_joy[2],  // bit7: P2 down
+                        ~p2_joy[0],  // bit6: P2 right
+                        ~p2_joy[4],  // bit5: P2 btn1
+                        ~p2_joy[6],  // bit4: start2
+                        ~p3_joy[3],  // bit3: P3 up
+                        ~p3_joy[1],  // bit2: P3 left
+                        ~p3_joy[4],  // bit1: P3 btn1
+                        ~p3_joy[6]}; // bit0: start3
+
+// GIN3 (port io_base+0x11): EEPROM DO (bit0), VBlank (bit1), service
+// (bit2 for JOY4_DIGITAL/pigout, bit3 for WHEELS3_PEDALS3/offroad --
+// bit width of PORT_SERVICE_NO_TOGGLE differs between the two real
+// INPUT_PORTS blocks).
+wire [7:0] gin3_wheels = {4'hF,
+                          ~service,    // bit3: service (active-low)
+                          1'b1,        // bit2: unused, float high
+                          ~vblank,     // bit1: VBlank (active-low)
+                          eeprom_do};  // bit0: real 93C46 DO
+wire [7:0] gin3_joy4 = {5'h1F,       // bits7:3: unused, float high
+                        ~service,    // bit2: service (active-low)
+                        ~vblank,     // bit1: VBlank (active-low)
+                        eeprom_do};  // bit0: real 93C46 DO
+wire [7:0] gin3_data = (input_scheme == JOY4_DIGITAL) ? gin3_joy4 : gin3_wheels;
+
+// WP-L3 pigout: fixed IN4 @ raw 0x7F (install_read_port, outside the
+// io_base window entirely -- MAME init_pigout()). P1 full digital
+// joystick + 2 buttons + start (leland.cpp INPUT_PORTS_START(pigout) IN4).
+wire io_gin4 = in4_port_en && (cpu_addr[7:0] == 8'h7F);
+wire [7:0] gin4_data = {~p1_joy[6],  // bit7: start1
+                        ~p1_joy[5],  // bit6: P1 btn2
+                        ~p1_joy[4],  // bit5: P1 btn1
+                        ~p1_joy[0],  // bit4: P1 right
+                        ~p1_joy[1],  // bit3: P1 left
+                        ~p1_joy[2],  // bit2: P1 down
+                        ~p1_joy[3],  // bit1: P1 up
+                        1'b1};       // bit0: unused
 
 // I/O writes
 // Sound command latch (leland_a.cpp command_lo_w/command_hi_w): a
 // 16-bit register the Master writes, shadowed here and also forwarded
 // via cmd_wr_data/cmd_wr_lo/cmd_wr_hi to the real 80186 sound board's
 // own command latch (leland_sound_board.sv, since WP10). The shadow
-// regs below aren't read back on this side; kept for the sound-command
-// history debug overlay (cmd_hist_*, near mcont_r below).
+// regs below aren't read back on this side.
 reg  [7:0] sound_cmd_lo_r, sound_cmd_hi_r;
 // leland_a.cpp m_sound_response: retired 2026-07-18. Was a 4-iteration
 // echo stub (sequence-bit-echo, see docs/WP10_PROGRESS.md history)
@@ -705,20 +756,6 @@ reg  [7:0] sound_cmd_lo_r, sound_cmd_hi_r;
 // song-transition handshake (it posts a real response byte and waits
 // for the Z80 to see it, which the stub could never produce).
 reg  [7:0] mcont_r;       // /MCONT shadow register
-
-// Sound-command history (2026-07-17, row-1 chars 30-38): 2-deep rolling
-// log of {hi (F4), lo (F2)} command pairs, latched on every command-lo
-// (io_cmd/F2) write -- freeze-investigation tap. Live MAME tracing found
-// one unique burst-handshake event near lap completion where real
-// hardware's 80186 takes ~110 poll iterations to ack (vs our stub's
-// zero-latency echo) -- this lets a real hardware freeze be compared
-// directly against the MAME-captured byte sequence
-// (0x71/0x83, 0x71/0x51, 0x71/0x92, then later 0x51/0xd6) to confirm or
-// rule out this handshake as the trigger. Values are sticky (last write
-// before a hang stays on screen); no trap/latch-on-anomaly logic needed
-// since a genuine CPU hang naturally freezes these registers in place.
-reg  [7:0] cmd_hist_hi0, cmd_hist_lo0; // older of the last 2 commands
-reg  [7:0] cmd_hist_hi1, cmd_hist_lo1; // most recent command
 
 reg [15:0] scroll_x_r, scroll_y_r;
 
@@ -756,10 +793,6 @@ always @(posedge clk_sys) begin
 		bank_reg         <= 3'd0;
 		sound_cmd_lo_r   <= 8'h00;
 		sound_cmd_hi_r   <= 8'h00;
-		cmd_hist_hi0     <= 8'h00;
-		cmd_hist_lo0     <= 8'h00;
-		cmd_hist_hi1     <= 8'h00;
-		cmd_hist_lo1     <= 8'h00;
 		scroll_x_r       <= 16'd0;
 		scroll_y_r       <= 16'd0;
 		ay_addr_r        <= 4'hF;
@@ -780,14 +813,6 @@ always @(posedge clk_sys) begin
 				sound_ctrl_wr_r   <= 1'b1;
 			end
 			if (io_cmd) begin
-				// Shift the 2-deep command-pair history: sound_cmd_hi_r
-				// already holds whatever the preceding F4 write set (F4
-				// always precedes F2 in the real protocol), so {hi,lo}
-				// captured here is the complete pair for this command.
-				cmd_hist_hi0     <= cmd_hist_hi1;
-				cmd_hist_lo0     <= cmd_hist_lo1;
-				cmd_hist_hi1     <= sound_cmd_hi_r;
-				cmd_hist_lo1     <= cpu_dout;
 				sound_cmd_lo_r   <= cpu_dout;
 				cmd_wr_data_r    <= cpu_dout;
 				cmd_wr_lo_r      <= 1'b1;
@@ -814,8 +839,6 @@ assign scroll_x      = scroll_x_r;
 assign scroll_y      = scroll_y_r;
 assign gfxbank        = gfxbank_r;
 assign slave_reset_n = mcont_r[0];  // 1=run, 0=hold in reset
-assign dbg_snd_cmd_hist = {cmd_hist_hi0, cmd_hist_lo0, cmd_hist_hi1, cmd_hist_lo1};
-assign dbg_mvport_stall = mvport_stall;
 // MAME leland_master_output_w: set_input_line(NMI, BIT(data,2) ? CLEAR_LINE : ASSERT_LINE)
 // i.e. bit2=1 -> NMI cleared (inactive), bit2=0 -> NMI asserted. slave_nmi_n
 // is active-low, so it must equal mcont_r[2] directly, NOT its inverse --
@@ -850,141 +873,6 @@ assign eeprom_cs  = mcont_r[6];
 // portrait/flag pixels read.
 assign cram_we = mem_access & ~wr_n & in_cram & mcont_r[1];
 
-// Debug outputs
-assign dbg_bank       = {1'b0, bank_reg};
-assign dbg_cpu_active = CE_6M & mem_access & ~rd_n;
-
-// Sticky read indicators for the 3 candidate "0xC?" ports (GIN0/GIN1/
-// MCONT) -- replaces trying to read a fast-changing hex digit off a
-// screenshot, which proved too fast to capture reliably. Each latches
-// on PERMANENTLY the first time the Master reads that specific port,
-// so a single, unhurried screenshot at any later point still shows
-// the answer.
-reg dbg_read_gin0, dbg_read_gin1, dbg_mcont_wr;
-always @(posedge clk_sys) begin
-	if (reset) begin
-		dbg_read_gin0 <= 1'b0;
-		dbg_read_gin1 <= 1'b0;
-		dbg_mcont_wr  <= 1'b0;
-	end else begin
-		if (CE_6M && io_rd && io_gin0)  dbg_read_gin0 <= 1'b1;
-		if (CE_6M && io_rd && io_gin1)  dbg_read_gin1 <= 1'b1;
-		if (CE_6M && io_wr && io_mcont) dbg_mcont_wr  <= 1'b1;
-	end
-end
-assign dbg_read_gin0_o = dbg_read_gin0;
-assign dbg_read_gin1_o = dbg_read_gin1;
-assign dbg_mcont_wr_o  = dbg_mcont_wr;
-assign dbg_scroll_wr_o  = CE_6M && io_wr &&
-                          (io_scroll_xlo || io_scroll_xhi || io_scroll_ylo || io_scroll_yhi);
-
-reg [15:0] dbg_pc_r;
-always @(posedge clk_sys)
-	if (CE_6M && mem_access && ~m1_n) dbg_pc_r <= cpu_addr;
-assign dbg_pc = dbg_pc_r;
-
-//------------------------------------------------------------------
-// Runaway-PC trap (2026-07-16). The hardware crash is NOT a tight loop:
-// every occurrence reports a different PC (C9B3, 56B3, 762x, DEAC), and
-// $DEAC disassembles as an all-zero region of ROM -- the Master takes a
-// bad jump/RET into dead space and NOP-sleds through it. A live PC
-// readout only ever shows where it ENDED UP, which is why every reading
-// looked different and none were actionable.
-//
-// This catches the jump SITE instead. A NOP sled advances PC by +1 per
-// fetch, which is never a discontinuity, so jump_from/jump_to still hold
-// the last real control-flow transfer -- the instruction that launched
-// the runaway -- at the moment the sled is detected. Freeze on detect so
-// a photo of the overlay is enough.
-//
-// "Discontinuity" = the next opcode fetch is not within +1..+4 of the
-// previous one (Z80 instructions are 1-4 bytes). Unsigned wrap makes the
-// same compare catch backward jumps.
-//------------------------------------------------------------------
-localparam [7:0] SLED_THRESHOLD = 8'd16;   // 16 consecutive NOPs; real code won't
-
-reg [15:0] prev_m1_pc;
-reg [15:0] jump_from_r, jump_to_r;
-reg  [2:0] jump_bank_r;   // bank_reg latched with jump_from -- the trap-time
-                          // bank (the live bank_reg may have changed by the
-                          // time the frozen row is photographed)
-reg  [7:0] sled_cnt;
-reg        sled_trapped_r;
-reg        m1_fetch_d;
-
-wire       m1_fetch_now = mem_access && ~m1_n && ~rom_stall;
-wire [15:0] pc_delta    = cpu_addr - prev_m1_pc;
-
-always @(posedge clk_sys) begin
-	if (reset) begin
-		prev_m1_pc     <= 16'd0;
-		jump_from_r    <= 16'd0;
-		jump_to_r      <= 16'd0;
-		jump_bank_r    <= 3'd0;
-		sled_cnt       <= 8'd0;
-		sled_trapped_r <= 1'b0;
-		m1_fetch_d     <= 1'b0;
-	end else if (CE_6M) begin
-		m1_fetch_d <= m1_fetch_now;
-		// one event per opcode fetch (the tv80 holds m1_n low across
-		// several CE_6M ticks -- same reason bank_wr_d1 exists above)
-		if (m1_fetch_now && !m1_fetch_d && !sled_trapped_r) begin
-			if (pc_delta > 16'd4) begin
-				jump_from_r <= prev_m1_pc;
-				jump_to_r   <= cpu_addr;
-				jump_bank_r <= bank_reg;
-			end
-			prev_m1_pc <= cpu_addr;
-
-			if (rom_data == 8'h00) begin
-				if (sled_cnt != 8'hFF) sled_cnt <= sled_cnt + 8'd1;
-				if (sled_cnt >= SLED_THRESHOLD) sled_trapped_r <= 1'b1;
-			end else begin
-				sled_cnt <= 8'd0;
-			end
-		end
-	end
-end
-
-assign dbg_jump_bank    = jump_bank_r;
-assign dbg_jump_from    = jump_from_r;
-assign dbg_jump_to      = jump_to_r;
-assign dbg_sled_trapped = sled_trapped_r;
-
-// Sticky: has the Master ever fetched an opcode from the banked ROM
-// window (0x2000-0xDFFF)? Answers "does PC ever leave the fixed bank"
-// with a single static bit instead of trying to read the live, rapidly
-// changing dbg_pc bit-block row off a photo/video capture.
-reg dbg_pc_left_fixed_r;
-always @(posedge clk_sys) begin
-	if (reset) dbg_pc_left_fixed_r <= 1'b0;
-	else if (CE_6M && mem_access && ~m1_n && (in_banked_lo || in_high)) dbg_pc_left_fixed_r <= 1'b1;
-end
-assign dbg_pc_left_fixed = dbg_pc_left_fixed_r;
-
-// Sticky: has the Master ever fetched an opcode from 0x0038-0x0066 --
-// the RST-38h-vectored interrupt region a sim trace showed the Master
-// living in once the sound response_r fix (port 0xF2) unblocked real
-// interrupt servicing, instead of looping forever re-running boot init.
-// Same static-photo-friendly pattern as dbg_pc_left_fixed_r above.
-reg dbg_pc_isr_r;
-always @(posedge clk_sys) begin
-	if (reset) dbg_pc_isr_r <= 1'b0;
-	else if (CE_6M && mem_access && ~m1_n && (cpu_addr >= 16'h0038) && (cpu_addr <= 16'h0066))
-		dbg_pc_isr_r <= 1'b1;
-end
-assign dbg_pc_isr_o = dbg_pc_isr_r;
-
-reg [7:0] dbg_io_addr_r;
-reg       dbg_io_rd_r;
-always @(posedge clk_sys)
-	if (CE_6M && (io_rd || io_wr)) begin
-		dbg_io_addr_r <= cpu_addr[7:0];
-		dbg_io_rd_r   <= io_rd;
-	end
-assign dbg_io_addr = dbg_io_addr_r;
-assign dbg_io_rd   = dbg_io_rd_r;
-
 //------------------------------------------------------------------
 // CPU data input mux
 //------------------------------------------------------------------
@@ -998,7 +886,9 @@ always @(*) begin
 	end else if (io_rd) begin
 		if      (io_gin0) cpu_din = gin0_data;
 		else if (io_gin1) cpu_din = gin1_data;
+		else if (io_gin2) cpu_din = gin2_data;
 		else if (io_gin3) cpu_din = gin3_data;
+		else if (io_gin4) cpu_din = gin4_data;
 		else if (io_adc1) cpu_din = p1_pedal;
 		else if (io_adc2) cpu_din = p2_pedal;
 		else if (io_adc3) cpu_din = p3_pedal;

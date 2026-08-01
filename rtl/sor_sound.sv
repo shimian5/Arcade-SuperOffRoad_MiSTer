@@ -49,63 +49,7 @@ module sor_sound(
     input  logic         rom_stall,
 
     // --- Audio output ---
-    output logic signed [15:0] audio_out,
-
-    // --- Debug/diagnostic taps (2026-07-18, "no sound during gameplay
-    // on real hardware" investigation, docs/WP10_PROGRESS.md): all
-    // sourced from signals that already exist as ports on i186_periph/
-    // leland_sound_board -- pure pass-through, no new logic in either
-    // of those modules. Intended consumer: sor_video.sv's always-on
-    // status overlay, replacing some of its now-stale Slave-ROM-bringup
-    // fields (see that file's own comment at the edit site). ---
-    output logic         dbg_dac_activity,   // 1-cycle pulse: any of the 6 8-bit DAC channels wrote
-    output logic         dbg_dac9_activity,  // 1-cycle pulse: the dac9 (10-bit, timer-paced) channel wrote
-    output logic         dbg_int0_pin,       // live level into i186_periph's external interrupt 0
-    output logic [7:0]   dbg_intc_request,   // i186_periph's intc_request_reg (bit4 = ext0 pending)
-    output logic [7:0]   dbg_intc_in_service,// i186_periph's intc_in_service_reg (bit4 = ext0 in service)
-
-    // Added after round-2 hardware read (intc_request=0x30 stuck,
-    // in_service=0x00 stuck): a Fable medium-effort sanity check on
-    // i186_periph.sv's request->poll_status pipeline found it
-    // structurally sound, but flagged the one legitimate way this
-    // exact static reading persists -- EXT0/EXT1 still masked (MSK bit,
-    // ext0/1_ctrl[3]) at reset default (7'hf = masked), never cleared
-    // by the ROM. These three let the overlay tell "still masked" apart
-    // from "unmasked but never granted" directly, without guessing.
-    output logic [6:0]   dbg_intc_ext0_ctrl, // i186_periph's intc_ext0_ctrl_reg (bit3=MSK, bit4=LTM)
-    output logic [6:0]   dbg_intc_ext1_ctrl, // same, ext1
-    output logic          dbg_intc_poll_pending, // = intc_poll_status[15] (= intr) -- did a request ever actually reach the CPU-visible poll/intr line at all
-
-    // Added after a Fable investigation found dac_activity/dac9_activity
-    // reading 0 was NOT a wiring bug -- it traced the audible reset pop
-    // to a DC-offset artifact in leland_dac_mixer.sv (now fixed
-    // separately) requiring zero real dac_wr activity, and flagged that
-    // dac_write_count=8/dac9_write_count=1 being invariant across every
-    // single simulation run but ABSENT on real hardware means the
-    // 80186 may never actually be completing (or even starting) its own
-    // boot self-test on real silicon at all. These are the decisive
-    // "is the CPU actually alive" taps: audiocpu_reset_n (did /RESET
-    // ever release), a Core bus-activity pulse (is Core issuing ANY bus
-    // transaction, independent of whether SDRAM/ROM works), and a
-    // ROM-word-fetch-completion pulse (is the CH_RD3 SDRAM channel --
-    // "never hardware-validated, unlike rd0/rd1" per this session's own
-    // earlier WP10_PROGRESS.md note -- actually delivering real bytes).
-    output logic          dbg_audiocpu_reset_n,
-    output logic          dbg_core_bus_activity,  // 1-cycle pulse: Core asserted instr_m_access or data_m_access
-    output logic          dbg_rom_fetch_activity, // 1-cycle pulse: one 16-bit ROM word fetch completed (rom_phase ROM_HI->ROM_DONE)
-
-    // Round-3 hardware read: audiocpu_reset_n=1, core_bus_activity and
-    // rom_fetch_activity both SATURATED at 0xFF -- the 80186 is
-    // genuinely alive and successfully fetching real ROM words via
-    // CH_RD3, ruling out "CPU never runs". But that activity counter
-    // can't tell "making real forward progress through boot code" apart
-    // from "stuck looping over a small address range forever" (e.g. an
-    // error/wait handler) -- the live IP is the direct answer. Tapped
-    // via hierarchical reference to the vendored Core's own internal
-    // `ip_current` (rtl/s80x86/Core.sv) -- no changes to that file
-    // itself, same technique sim/sor_sound_tb.sv already uses for
-    // register readback.
-    output logic [15:0]   dbg_core_ip
+    output logic signed [15:0] audio_out
 );
 
 // =====================================================================
@@ -508,24 +452,5 @@ wire [15:0] rom_data_word = {rom_hi_byte, rom_lo_byte};
 
 assign mem_ack     = mem_is_ram ? ram_ack      : rom_done_ack;
 assign mem_data_in = mem_is_ram ? ram_data_in_r : rom_data_word;
-
-// --- Debug/diagnostic taps (see port declarations above) ---
-assign dbg_dac_activity  = dac_wr[0] | dac_wr[1] | dac_wr[2] | dac_wr[3] | dac_wr[4] | dac_wr[5];
-assign dbg_dac9_activity = dac9_wr;
-assign dbg_int0_pin      = int0_pin;
-assign dbg_intc_request  = intc_request_reg;
-assign dbg_intc_in_service = intc_in_service_reg;
-assign dbg_intc_ext0_ctrl = intc_ext0_ctrl_reg;
-assign dbg_intc_ext1_ctrl = intc_ext1_ctrl_reg;
-assign dbg_intc_poll_pending = intr;
-assign dbg_audiocpu_reset_n  = audiocpu_reset_n;
-// instr_m_ack/data_m_ack (not the *_access levels, which stay high for
-// a transaction's full multi-cycle duration) -- matches this whole
-// system's "ack fires for exactly one cycle" convention, so this is a
-// true one-shot-per-transaction pulse, safe to feed a rolling counter
-// without over-counting a single long transaction multiple times.
-assign dbg_core_bus_activity = instr_m_ack | data_m_ack;
-assign dbg_rom_fetch_activity = (rom_phase == ROM_HI) && !rom_stall;
-assign dbg_core_ip = core_ip_dbg;
 
 endmodule

@@ -1,0 +1,17 @@
+../rtl/tv80/rtl/core/tv80_alu.v
+../rtl/tv80/rtl/core/tv80_reg.v
+../rtl/tv80/rtl/core/tv80_mcode.v
+../rtl/tv80/rtl/core/tv80_core.v
+../rtl/tv80s_ce.v
+../rtl/sdram_banked.sv
+../rtl/sor_vram_port.sv
+../rtl/leland_board_pkg.sv
+../rtl/rom_line_cache.sv
+../rtl/sor_board.sv
+../rtl/sor_master.sv
+../rtl/sor_slave.sv
+../rtl/sor_video.sv
+../rtl/sor_dpram.sv
+../rtl/sor_eeprom_93c46.sv
+mt48lc16m16a2.v
+sor_board_tb.sv

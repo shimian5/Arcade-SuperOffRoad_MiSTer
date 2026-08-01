@@ -43,6 +43,7 @@ assign AUDIO_MIX = 0;
 
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
+assign LED_USER  = 0;
 assign BUTTONS   = 0;
 
 //----------------------------------------------------------------
@@ -67,9 +68,25 @@ localparam CONF_STR = {
 	"-;",
 	"O[10],D-Pad Steering,Velocity,Position;",
 	"-;",
+	// Debug overlay (2026-07-25, Pig Out slow-motion investigation): on-screen
+	// hex counters over the top of active video, see rtl/sor_video.sv's
+	// overlay render block. status[11] was verified unused (bits in use:
+	// 0,2,4,5,6:7,8:9,10,121:122) before picking it -- a plain O[n] toggle,
+	// not a J1 button, so it cannot invalidate saved MiSTer control mappings.
+	"O[11],Debug Overlay,Off,On;",
+	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
-	"J1,Nitro,Coin,Gas;",
+	// 4th button added for pigout's JOY4_DIGITAL scheme (bit7 = coin,
+	// see p1_joy/gin1_joy4/gin0_joy4 in rtl/sor_master.sv) -- unused/
+	// harmless for offroad/offroadt's WHEELS3_PEDALS3 scheme, which only
+	// consumes bits 4/5/6 (Nitro/Coin/Gas). Without a 4th declared
+	// button here, the OSD never exposes anything to map onto bit7, so
+	// pigout's coin input is permanently stuck low regardless of what
+	// the player binds -- confirmed as the root cause of "pigout
+	// controls don't work at all" on hardware (game never leaves
+	// attract mode because coin never registers).
+	"J1,Nitro,Coin,Gas,Start;",
 	"v,0;",
 	"V,v",`BUILD_DATE
 };
@@ -90,6 +107,9 @@ wire        ioctl_wait;
 
 // Three-player digital buttons ([3]=coin, [2]=btn2, [1]=btn1, [0]=btn0)
 wire [31:0] joy1, joy2, joy3;
+// WP-L3: 4th player, JOY4_DIGITAL (pigout) only -- unused for the default
+// WHEELS3_PEDALS3 games.
+wire [31:0] joy4;
 // Analog: signed -127..+127, [15:8]=Y (unused -- gas is digital, see p1_pedal
 // below), [7:0]=X (one of three steering inputs combined by steering_input.sv)
 wire [15:0] joy1_ana, joy2_ana, joy3_ana;
@@ -119,6 +139,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.joystick_0(joy1),
 	.joystick_1(joy2),
 	.joystick_2(joy3),
+	.joystick_3(joy4),
 	.joystick_l_analog_0(joy1_ana),
 	.joystick_l_analog_1(joy2_ana),
 	.joystick_l_analog_2(joy3_ana),
@@ -130,7 +151,8 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	// Unused rumble outputs
 	.joystick_0_rumble(16'd0),
 	.joystick_1_rumble(16'd0),
-	.joystick_2_rumble(16'd0)
+	.joystick_2_rumble(16'd0),
+	.joystick_3_rumble(16'd0)
 );
 
 //----------------------------------------------------------------
@@ -141,7 +163,9 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 //   Pixel@ ~7.16MHz → fractional phase accumulator
 //----------------------------------------------------------------
 wire clk_sys;
-wire clk_sdram; // phase-shifted 48 MHz PLL output feeding SDRAM_CLK (docs/sdram_plan.md Section 3a)
+wire clk_sdram; // phase-shifted 48 MHz PLL output feeding SDRAM_CLK (docs/sdram_plan.md
+                 // Section 3a; WP-L3's 96MHz dedicated-clock/CDC-bridge scheme was
+                 // reverted 2026-07-22 -- see rtl/pll/pll_0002.v's outclk_1 comment)
 wire pll_locked;
 
 pll pll
@@ -219,6 +243,17 @@ wire [7:0] p1_gas = joy1[6] ? 8'hFF : 8'h00;
 wire [7:0] p2_gas = joy2[6] ? 8'hFF : 8'h00;
 wire [7:0] p3_gas = joy3[6] ? 8'hFF : 8'h00;
 
+// WP-L3: 4-player digital joystick for JOY4_DIGITAL (pigout) -- direct
+// passthrough of MiSTer's standard joystick vector low byte, which
+// already matches sor_board's p*_joy bit convention exactly ([0]=right
+// [1]=left [2]=down [3]=up [4]=btn1 [5]=btn2), with the two spare fire
+// bits repurposed as start/coin, same established pattern as the p1_btn
+// nitro/coin remap above.
+wire [7:0] p1_joy = joy1[7:0];
+wire [7:0] p2_joy = joy2[7:0];
+wire [7:0] p3_joy = joy3[7:0];
+wire [7:0] p4_joy = joy4[7:0];
+
 //----------------------------------------------------------------
 // Board
 //----------------------------------------------------------------
@@ -288,9 +323,17 @@ sor_board board
 	.p2_pedal(p2_gas),
 	.p3_pedal(p3_gas),
 
+	// WP-L3: 4-player digital joystick (JOY4_DIGITAL/pigout only).
+	.p1_joy(p1_joy),
+	.p2_joy(p2_joy),
+	.p3_joy(p3_joy),
+	.p4_joy(p4_joy),
+
 	// Service / free play from OSD
 	.service(status[4]),
 	.free_play(status[5]),
+
+	.show_overlay(status[11]),
 
 	.audio_out(audio_out)
 );
@@ -304,16 +347,9 @@ assign CE_PIXEL  = ce_pix;
 assign VGA_DE = ~(HBlank | VBlank);
 assign VGA_HS = HSync;
 assign VGA_VS = VSync;
-assign VGA_R  = rgb[23:16];
-assign VGA_G  = rgb[15:8];
-assign VGA_B  = rgb[7:0];
 
-//----------------------------------------------------------------
-// Activity LED — heartbeat while board is running
-//----------------------------------------------------------------
-reg [26:0] act_cnt;
-always @(posedge clk_sys) act_cnt <= act_cnt + 1'd1;
-assign LED_USER = act_cnt[26] ? act_cnt[25:18] > act_cnt[7:0]
-                               : act_cnt[25:18] <= act_cnt[7:0];
+assign VGA_R = rgb[23:16];
+assign VGA_G = rgb[15:8];
+assign VGA_B = rgb[7:0];
 
 endmodule

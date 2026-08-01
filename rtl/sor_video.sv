@@ -25,6 +25,8 @@
 //
 // SOR_TEST_PATTERN removed — real VRAM data now flowing (Chunk 3)
 
+import leland_board_pkg::*;
+
 module sor_video
 (
 	input         clk_sys,
@@ -60,257 +62,74 @@ module sor_video
 	// register 0x0E (I/O Port A) -- no actual AY8910 sound synthesis.
 	input   [7:0] gfxbank,
 
-	// Background tile ROM (gfx_rom in sor_board.sv) — one shared read
-	// port, time-multiplexed across the 3 bitplanes by this module.
-	output [16:0] gfx_addr,
-	input   [7:0] gfx_data,
+	// WP-L2: gfx/prom tile ROM content lives in SDRAM now (not BRAM) --
+	// this module owns the fetch_ph FSM below and drives sor_board.sv's
+	// rd2 arbiter channel directly (request/ack handshake, variable
+	// latency, unlike the old 1-cycle BRAM read). One shared channel,
+	// time-multiplexed across the prom lookup byte and the 3 gfx
+	// bitplane bytes.
+	output        sdram_rd2_req,
+	input         sdram_rd2_ack,
+	output [24:0] sdram_rd2_addr,
+	input   [7:0] sdram_rd2_data,
+	// Wider-reads path (2026-07-22): the full 16-bit word the SDRAM
+	// controller already captured, unmuxed -- used by FP_GFXROW_REQ/WAIT,
+	// which targets the ADDR_GFXROW_BASE packed entry (see
+	// rtl/sor_board.sv's gfx-repack FSM) holding plane0/plane1 in word0.
+	input  [15:0] sdram_rd2_data16,
+	// WP-M8 (2026-07-24): second burst word of the same GFXROW read
+	// (BURST_LEN=2 on the shared sdram_ctrl) -- {8'h00, plane2}. See
+	// rtl/sor_board.sv's sdram_rd2_data16_hi comment for how this is
+	// captured (sd_burst_words[1] at the same ack cycle as data16).
+	input  [15:0] sdram_rd2_data16_hi,
 
-	// Background tile lookup PROM (prom_rom in sor_board.sv)
-	output [16:0] prom_addr,
-	input   [7:0] prom_data,
+	// Whole-tile-fetch-burst-in-progress flag for sor_board.sv's rd2
+	// aging/boost logic (2026-07-22): fetch_ph != FP_IDLE, i.e. true from
+	// the moment a tile fetch is armed until its last sub-request (gfx
+	// plane 2) is acked, spanning the brief 1-cycle req-line gaps BETWEEN
+	// the burst's individual sub-requests. The arbiter's own rd2_pending
+	// (req && !ack) drops during exactly those gaps, which was silently
+	// resetting the aging counter/boost latch every sub-request instead
+	// of once per tile -- this lets the arbiter distinguish "between
+	// sub-requests of one burst" from "genuinely idle, no fetch pending".
+	output        fetch_busy,
+
+	// Ring-buffer occupancy (2026-07-22, root-cause fix for the rd2-only
+	// urgency escalation's own regression): rd2_fetch_busy alone can't
+	// distinguish "genuinely at risk of underrunning" from "just doing
+	// its normal, near-continuous greedy refill" -- the producer re-arms
+	// every cycle it has any room at all (see rbuf_has_room below), so
+	// fetch_busy is true almost all the time regardless of how full the
+	// buffer actually is. sor_board.sv's rd2 urgency escalation now
+	// gates on THIS (buffer running low) instead of/in addition to raw
+	// busy-time, so it only preempts round-robin when rd2 is actually
+	// close to an underrun, not on every ordinary fetch burst.
+	output  [3:0] rbuf_count_out,
 
 	// Raster line counter output (for Slave Z80 synchronisation)
 	output  [7:0] raster_line,
 
-	// Debug overlay inputs
-	// dbg_bank[4:0] — repurposed as latched status bits (see sor_board.sv):
-	//   [0] red   : sdram_ready
-	//   [1] green : slave_reset_n (Master released Slave)
-	//   [2] blue  : Master ever issued a VRAM I/O port op
-	//   [3] white : vram_we ever fired (Slave wrote VRAM)
-	//   [4] orange: Master PC ever fetched from banked ROM (>=0x2000)
-	input  [4:0] dbg_bank,
-	input        dbg_cpu_active,  // pulses each Master Z80 memory-read cycle
-	input [15:0] dbg_pc,          // Master CPU PC latched at each opcode fetch
-	input  [7:0] dbg_irq_cnt,     // saturating count of periodic_int_n (raster IRQ) firings
-	// Sticky I/O-read indicators: replaces trying to read a fast-
-	// changing hex port address off a screenshot. Each latches on
-	// permanently the first time the Master reads that port, so any
-	// later screenshot still shows the answer.
-	input        dbg_read_gin0,   // 0x00/0xC0/0x80 -- GIN0 (nitro buttons)
-	input        dbg_read_gin1,   // 0x01/0xC1/0x81 -- GIN1 (coin inputs, slave halt)
-	input        dbg_mcont_wr,    // 0x09/0xC9/0x89 -- MCONT write (slave release)
-	input        dbg_ever_cram,   // sticky: Master ever wrote Color RAM
-	input        dbg_ever_scroll, // sticky: Master ever wrote a scroll register
-	input        dbg_ever_vram,   // sticky: Slave ever wrote a VRAM byte
-	input        dbg_pc_isr,      // sticky: Master PC ever entered 0x0038-0x0066
-	input  [7:0] dbg_rom_byte,    // last byte fetched from SDRAM (Master ROM)
-	input  [7:0] dbg_io_addr,     // last I/O port address accessed by Master
-	input        dbg_io_rd,       // 1=read, 0=write
-
-	// SDRAM write/readback integrity check (Master ROM)
-	input  [7:0] dbg_wr_chk,      // running sum accumulated while writing ROM
-	input  [7:0] dbg_rd_chk,      // running sum accumulated while reading it back
-	input        dbg_chk_done,    // readback scan finished
-	input        dbg_chk_match,   // wr_chk == rd_chk (only meaningful when done)
-
-	// Same integrity check, split by address parity (even/odd byte) to
-	// localize whether the DQM low/high-byte write-select is at fault
-	input  [7:0] dbg_wr_chk_even,
-	input  [7:0] dbg_rd_chk_even,
-	input        dbg_chk_match_even,
-	input  [7:0] dbg_wr_chk_odd,
-	input  [7:0] dbg_rd_chk_odd,
-	input        dbg_chk_match_odd,
-
-	// Same integrity check, split into 4 x 64KB quarters matching the
-	// Master ROM's 4 physical files — localizes a mismatch to one file.
-	input  [3:0] dbg_chk_match_q,
-	input        dbg_chk_done_q,
-
-	// Isolated single-byte SDRAM write/readback self-test — completely
-	// independent of ROM loading/content and the CPUs.
-	input        dbg_bt_done,
-	input        dbg_bt_pass,
-	input  [7:0] dbg_bt_readback,
-	// Second (odd-address) half of the paired byte-test -- see
-	// sor_board.sv's BT_PATTERN2 comment. dbg_bt_readback is now the
-	// EVEN address (expect 0xA5), this is the ODD address (expect
-	// 0x5A); a lane fault makes them read the same value.
-	input  [7:0] dbg_bt_readback2,
-
-	// Ground-truth spot check: actual first 4 bytes read back from SDRAM
-	// at Master ROM addresses 0-3 (compare directly against a known ROM
-	// hex dump, e.g. expect "F3 ED 56 31").
-	input  [7:0] dbg_scan_b0,
-	input  [7:0] dbg_scan_b1,
-	input  [7:0] dbg_scan_b2,
-	input  [7:0] dbg_scan_b3,
-
-	// Mirror on the WRITE side: actual bytes the core handed to the
-	// SDRAM write port at addresses 0-3, independent of whatever the
-	// read-back scan reports -- separates "wrong data going in" from
-	// "wrong data coming back out".
-	input  [7:0] dbg_wr_b0,
-	input  [7:0] dbg_wr_b1,
-	input  [7:0] dbg_wr_b2,
-	input  [7:0] dbg_wr_b3,
-
-	// Address 0 read back from SDRAM right as the Master ROM finishes
-	// loading (before the Slave ROM's ~512KB even starts) -- compare
-	// against dbg_scan_b0 (the same address, but read back only at the
-	// very end, after everything has loaded) to test whether SDRAM
-	// retention over the load's duration is the source of corruption.
-	input  [7:0] dbg_early_b0,
-
-	// Address 0 read back IMMEDIATELY after its own write acknowledges
-	// -- essentially zero elapsed time. The most decisive of the three:
-	// if this is also wrong, the fault is in the actual SDRAM write or
-	// in reading it back moments later, not decay over time.
-	input  [7:0] dbg_immediate_b0,
-
-	// Running count of real rd2-channel completions (sdram_rd2_ack
-	// pulses) seen so far, saturating at 0xFF. Sampled here purely for
-	// display -- lets us tell, on the next hardware run, whether
-	// dbg_scan_b0 (which came back matching the byte-test's own
-	// BT_PATTERN rather than the real ROM byte) reflects a genuinely
-	// fresh SDRAM transaction or a stale/reused completion: if the
-	// count at the moment scan_b0 latches is not at least 3 (immediate
-	// check + byte-test + this read), something upstream of the SDRAM
-	// core itself is failing to issue a real new transaction for it.
-	input  [7:0] dbg_rd2_ack_cnt,
-
-	// Re-test of the ioctl_addr skew theory at address 2 (not exempted
-	// by hps_io's skip_add the way address 0 is). raw_addr = the RAW
-	// (undelayed) ioctl_addr's low byte at the moment ioctl_addr_d1
-	// first reads 2. If a real one-cycle skew exists, raw_addr should
-	// read 3 here (already advanced past); if it reads 2, no skew.
-	input  [7:0] dbg_accept2_raw_addr,
-	input  [7:0] dbg_accept2_data,
-
-	// Ground truth of the ARM's download-session structure: total
-	// number of ioctl_download sessions (falling edges) seen. The MRA
-	// was rewritten to a single index="0" download session (see its own
-	// header comment for why -- the old five-<rom>-region structure had
-	// a real hardware bug), so the expected value is now 01 -- any
-	// other number means the ARM's real session structure differs from
-	// what sor_board.sv's single-session address-range routing assumes.
-	input  [7:0] dbg_dl_sessions,
-
 	//------------------------------------------------------------------
-	// Slave-side debug taps (Follow-up 6, docs/SESSION_2026-07-14.md) --
-	// repurpose status-row chars 10-16/18-28/30-34 (stale, confirmed-
-	// passing diagnostics) for hardware evidence of the organic
-	// `ld ($C000),a` bank switch. See sor_slave.sv's port comments.
+	// Debug overlay (2026-07-25, Pig Out slow-motion investigation
+	// instrumentation, see docs/SESSION_2026-07-24_PIGOUT_INVESTIGATION_
+	// HANDOFF.md). Display-only: renders seven per-frame hex counters
+	// over the top rows of active video when show_overlay is high.
+	// Touches no game logic; when show_overlay is low the whole render
+	// path below reduces to dead logic feeding a mux that always picks
+	// the real pixel, same shape as the pre-b01c24b overlay this
+	// restores a minimal version of. Counter update/render logic lives
+	// entirely in this module (it already owns VBlank locally); the
+	// five *_tick inputs are one-clk_sys-wide event pulses sourced from
+	// sor_board.sv, which is in the right place to see them.
 	//------------------------------------------------------------------
-	input [15:0] dbg_s_pc,
-	input  [3:0] dbg_s_bank_reg,
-	input  [7:0] dbg_s_bank_wr_cnt,
-	input  [3:0] dbg_s_bank_max,
-	input [15:0] dbg_s_vram_wr_cnt,
-	input        dbg_s_banked_read_ever,
-
-	//------------------------------------------------------------------
-	// Reset-gating taps (2026-07-15) -- repurpose status-row chars 36-39,
-	// which used to show scroll_y[10:8]/scroll_x[10:8]/gfxbank (both
-	// mysteries those chased are resolved: gfxbank C7 explained as inert
-	// AY8910 bits, and the bg-pipeline audit proved scroll/tile addressing
-	// pixel-exact vs MAME). Tests whether the Slave core ever actually
-	// leaves reset on this hardware -- one of the standing hypotheses for
-	// why 7ec580f's bank-switch fix shows no visual change on hardware
-	// despite passing organically in sim (see sor_board.sv's Slave reset
-	// input: reset | ~sdram_ready | ~slave_reset_n | ~dl_settled).
-	//------------------------------------------------------------------
-	//------------------------------------------------------------------
-	// Sound-command history (2026-07-17, row-1 chars 30-38, replaces the
-	// resolved reset-gating taps that used to live in chars 36-39):
-	// 2-deep rolling log of {hi (F4), lo (F2)} sound-command pairs from
-	// sor_master.sv, freeze-investigation tap -- see its own comment
-	// there. {hi0,lo0,hi1,lo1}, most recent pair last.
-	//------------------------------------------------------------------
-	input [31:0] dbg_snd_cmd_hist,
-
-	//------------------------------------------------------------------
-	// Sound-board audio-activity taps (2026-07-18, "no sound during
-	// gameplay on real hardware despite a clean boot pop" investigation,
-	// docs/WP10_PROGRESS.md): pure pass-through from sor_sound.sv's own
-	// new debug ports (which themselves just expose signals already
-	// present on i186_periph/leland_sound_board -- no new logic in
-	// either). dbg_dac_activity/dbg_dac9_activity are 1-cycle pulses;
-	// this module turns them into rolling counters below (same idiom as
-	// the existing dbg_s_bank_wr_cnt/dbg_s_vram_wr_cnt counters).
-	//------------------------------------------------------------------
-	input        dbg_dac_activity,
-	input        dbg_dac9_activity,
-	input        dbg_snd_int0_pin,
-	input  [7:0] dbg_snd_intc_request,
-	input  [7:0] dbg_snd_intc_in_service,
-	// Added after round-2 hardware read (intc_request=0x30 stuck,
-	// in_service=0x00 stuck, static regardless of game state): a Fable
-	// sanity check on i186_periph.sv's request->poll_status pipeline
-	// found it structurally sound, but flagged the one legitimate way
-	// this exact reading persists -- EXT0/EXT1 still masked (MSK bit,
-	// ext0/1_ctrl[3]) at reset default, never cleared by the ROM. These
-	// distinguish "still masked" (ctrl reads 0x0F) from "unmasked but
-	// never granted" (ctrl's bit3 clear) directly.
-	input  [6:0] dbg_snd_intc_ext0_ctrl,
-	input  [6:0] dbg_snd_intc_ext1_ctrl,
-	input        dbg_snd_intc_poll_pending, // = intc_poll_status[15] (=intr): did a request ever actually reach the CPU-visible poll/intr line at all
-
-	//------------------------------------------------------------------
-	// Sound-CPU liveness taps (2026-07-18, same investigation): the
-	// decisive next hardware read. A Fable investigation confirmed
-	// dac_activity/dac9_activity reading 0 was NOT a wiring bug -- and
-	// flagged that dac_write_count=8/dac9_write_count=1 being invariant
-	// across every single simulation run but ABSENT on real hardware
-	// means the 80186 may never be completing (or even starting) its
-	// own boot self-test on real silicon at all. Shown on a new third
-	// always-on status row (vc 16..23) below.
-	//------------------------------------------------------------------
-	input        dbg_snd_audiocpu_reset_n,  // did /RESET ever release
-	input        dbg_snd_core_bus_activity, // 1-cycle pulse: Core issued any bus transaction
-	input        dbg_snd_rom_fetch_activity,// 1-cycle pulse: one ROM word fetch completed via CH_RD3
-	// Round-3 read: reset_n=1, both activity counters SATURATED --
-	// 80186 confirmed alive and fetching real ROM. Live IP distinguishes
-	// genuine forward progress through boot code from a stuck loop --
-	// see dbg_core_ip's own comment in sor_sound.sv.
-	input [15:0] dbg_snd_core_ip,
-
-	//------------------------------------------------------------------
-	// Runaway-PC trap (2026-07-16) -- shown on its own always-on second
-	// status row (vc 8..15). The crash is a runaway, not a loop: the live
-	// PC only ever shows where it landed (a NOP sled in dead ROM), which
-	// differs every time and says nothing. These freeze on detect and name
-	// the jump that caused it. Row 2 layout, 8px per char:
-	//   0-3  : jump_from -- PC of the last control-flow transfer before
-	//          the runaway, i.e. THE INSTRUCTION THAT CRASHED IT
-	//   5-8  : jump_to   -- where it jumped (start of the sled)
-	//   10   : 1 = trap fired (values frozen), 0 = not fired (values live)
-	//   12   : Master bank_reg (added 2026-07-16, see dbg_m_bank_reg below)
-	//------------------------------------------------------------------
-	input [15:0] dbg_jump_from,
-	input [15:0] dbg_jump_to,
-	input        dbg_sled_trapped,
-
-	// Master bank_reg (2026-07-16, docs/SESSION_2026-07-16.md section 8d):
-	// added to the runaway-trap row (char 12) so a banked jump_from/PC can
-	// be resolved to a specific ROM image instead of being ambiguous
-	// across all 7 banks. Same layout row as jump_from/jump_to above.
-	input  [2:0] dbg_m_bank_reg,
-
-	// Live fetch-mismatch counter (docs/sdram_plan.md Section 2) -- unlike
-	// fgck (title-screen only) this polls a fixed Master-ROM address
-	// continuously during gameplay, so it catches SDRAM read corruption
-	// live rather than only at boot. Row-2 chars 19-21:
-	//   19-20: live_mm_cnt[7:0], saturating -- 00 while clean
-	//   21   : live_poll_cnt[3:0] -- must visibly spin (liveness proof)
-	input [11:0] dbg_live_mm,
-
-	// Stall detector (2026-07-17, freeze investigation, row-2 chars
-	// 23-30): frozen ONCE when the game stops making VRAM-write progress
-	// for ~8s -- see sor_board.sv's stall-detector comment. dbg_stall_pc
-	// = Master PC at that moment; dbg_stall_flags = {mvport_stall(1),
-	// cur_side(1), seq_state(3)} of the VRAM-port sequencer, same
-	// instant. All-zero until a stall is ever detected.
-	input [15:0] dbg_stall_pc,
-	input  [4:0] dbg_stall_flags,
-	input  [2:0] dbg_stall_bank, // live bank_reg at the frozen instant -- resolves which
-	                            // banked ROM image dbg_stall_pc belongs to
-
-	// WRAM dump at the frozen instant (freeze investigation, row-2 chars
-	// 32-38): {e712,e715,e716} -- suspected list-scan loop's flag byte
-	// and 16-bit list pointer. All-zero until a stall latches.
-	input [23:0] dbg_wram_dump
+	input         show_overlay,
+	input         master_stall_tick,     // CE_6M tick, master ROM/SDRAM stall
+	input         slave_stall_tick,      // CE_6M tick, slave  ROM/SDRAM stall
+	input         slave_port_stall_tick, // CE_6M tick, slave VRAM-port stall
+	input         mrom_access_tick,      // master ROM line-cache completion
+	input         mrom_miss_tick,        // ...that completion was a miss
+	input         slave_vram_write_tick, // one pulse per completed slave VRAM write op
+	input         rd2_grant_tick         // one pulse per rd2 SDRAM grant
 );
 
 //------------------------------------------------------------------
@@ -352,6 +171,21 @@ always @(posedge clk_sys) begin
 		end
 	end
 end
+
+// REVERTED 2026-07-22: a scroll_x/scroll_y frame-latch was added here on
+// the theory that mid-frame scroll writes were an unintended tearing bug.
+// Checked against the actual MAME reference (docs/reference/mame/
+// leland_v.cpp:156-158) before shipping it further: scroll_w() calls
+// m_screen->update_partial(vpos()-1) before applying the new value --
+// i.e. real Leland hardware/MAME explicitly supports and this driver
+// uses mid-frame scroll changes (e.g. a HUD/status split), rendering
+// everything before the write with the old value and everything after
+// with the new one. That is precisely what reading scroll_x/scroll_y
+// live and combinationally (no latch) already does -- the original
+// behavior was correct, not a bug. Latching it to once-per-frame would
+// have silently broken any real mid-frame scroll split effect the game
+// uses. Reverted; do not reintroduce without first confirming the real
+// visual symptom against this reference behavior, not assumption.
 
 // Blanking and sync — combinational off counters, registered on clk_sys
 always @(posedge clk_sys) begin
@@ -396,48 +230,6 @@ end
 wire [3:0] fg_pen = hc_lsb ? vram_latch[3:0] : vram_latch[7:4];
 
 //------------------------------------------------------------------
-// Foreground-pen region checksum (2026-07-17 instrument).
-// Passive tap on the final fg pen stream: per frame, sums fg_pen over
-// the copyright-text region of the title screen (visible-pixel box
-// x 24..215, y 176..215, counted the same way the board-TB SCANOUT
-// capture indexes pixels: x = pens since HBlank fall, y = visible
-// lines since VBlank fall). Latched at each VBlank rise and shown as
-// 4 hex chars on status row 2 (chars 14-17). Purpose: hardware shows
-// the first title draw with character gaps while the sim scan-out is
-// pixel-perfect; this splits the divergence in one photo -- if the
-// displayed sum equals the sim-expected value while the screen shows
-// gaps, corruption enters DOWNSTREAM of the pen stream (palette /
-// overlay / framework scaler); if it differs, the fetch or VRAM
-// content is already wrong inside the core. Churning digits = per-
-// frame variation (live fetch trouble); stable digits = static.
-//------------------------------------------------------------------
-reg [15:0] fgck_acc, fgck_lat;
-reg  [8:0] fgck_x;
-reg  [8:0] fgck_y;
-reg        fgck_hb_d, fgck_vb_d;
-always @(posedge clk_sys) begin
-	if (ce_pix) begin
-		fgck_hb_d <= HBlank;
-		fgck_vb_d <= VBlank;
-		if (VBlank && !fgck_vb_d) begin
-			fgck_lat <= fgck_acc;
-			fgck_acc <= 16'd0;
-			fgck_y   <= 9'd0;
-		end
-		if (HBlank && !fgck_hb_d) begin
-			fgck_x <= 9'd0;
-			if (!VBlank) fgck_y <= fgck_y + 9'd1;
-		end
-		if (!VBlank && !HBlank) begin
-			if (fgck_y >= 9'd176 && fgck_y < 9'd216 &&
-			    fgck_x >= 9'd24  && fgck_x < 9'd216)
-				fgck_acc <= fgck_acc + {12'd0, fg_pen};
-			fgck_x <= fgck_x + 9'd1;
-		end
-	end
-end
-
-//------------------------------------------------------------------
 // Background ROM tilemap — validated against MAME leland_v.cpp
 // leland_get_tile_info/leland_scan/screen_update.
 //
@@ -447,10 +239,14 @@ end
 // (our gfx_rom), each plane RGN_FRAC(1,3) of the ROM.
 //
 // One tile's lookup + 3 plane bytes are fetched a tile ahead of when
-// they're displayed (armed when the display reaches the middle of
-// the current tile, giving ~4 pixels/~28 clk_sys cycles of slack for
-// 4 sequential 1-cycle BRAM reads -- comfortable margin at 48MHz
-// clk_sys vs ~7.16MHz ce_pix).
+// they're displayed (armed at the START of the currently-displaying
+// tile, giving 8 pixels/~54 clk_sys cycles of slack -- WP-L2: doubled
+// from the original LEAD=4 mid-tile arm now that the 4 sequential
+// reads go to SDRAM via sor_board.sv's rd2 arbiter channel (variable
+// latency, req/ack handshake) instead of 1-cycle BRAM reads. ~54
+// clk_sys cycles gives ~2x margin over the ~20-25 cycles four
+// sequential 5-cycle SDRAM reads plus rd2's high-priority arbitration
+// wait are expected to need).
 //------------------------------------------------------------------
 wire [10:0] eff_x = hc[9:0] + scroll_x[10:0];
 wire [10:0] eff_y = {2'b0, vc} + scroll_y[10:0];
@@ -465,6 +261,16 @@ function automatic [16:0] leland_tile_idx(input [7:0] col, input [7:0] row);
 endfunction
 
 reg [3:0] fetch_ph;
+// Hardware bring-up debug (2026-07-22): pulses for one clk_sys cycle every
+// time the tile commit below finds the fetch STILL incomplete and holds
+// the previous tile instead of committing fresh data -- every real
+// "stale commit" event. Three fixes to this fetch/scheduling path
+// (commit-gate, PROM re-fetch elimination) showed zero visible
+// improvement on real hardware despite sim confirming the underlying
+// deadline misses are real -- this + the saturating counter/corner
+// overlay near the rgb output below gives a direct, real-hardware answer
+// to whether this mechanism is firing at any meaningful rate in
+// practice, instead of guessing at yet another fix blind.
 reg [7:0] fetch_col, fetch_row;
 reg [2:0] fetch_riy; // row-in-tile of the TARGET pixel, latched at arm time:
                      // a row-start fetch is armed during the previous row's
@@ -472,130 +278,641 @@ reg [2:0] fetch_riy; // row-in-tile of the TARGET pixel, latched at arm time:
                      // row_in_tile would be one scanline stale there --
                      // mid-row arms latch the identical live value.
 reg [7:0] prom_byte_next;
-reg [7:0] gfx0_next, gfx1_next, gfx2_next;
+
+// PROM re-fetch elimination (2026-07-22, WP-L2 bandwidth fix -- modeled on
+// Darius_MiSTer's tile-ROM cache, see rtl/darius/tile_rom_arbiter.sv): the
+// PROM byte (tile selection + palette, prom_sdram_addr) is addressed
+// purely by (fetch_col, fetch_row, gfxbank[3]/prom_bank) -- NOT by
+// fetch_riy (row-within-tile). Since a tile spans 8 scanlines and only
+// fetch_riy changes between them, the fetch FSM was re-issuing an
+// identical PROM read on 7 out of every 8 scanlines for zero new
+// information -- one quarter of ALL rd2 SDRAM traffic was pure waste.
+// Caching the last-fetched (col,row,bank3) tuple and skipping straight to
+// FP_GFX0_REQ when it still matches cuts total tile-row fetches from 4 to
+// 3 for 7/8 of all fetches, with no ROM/MRA layout change and no address-
+// math change -- gfxbank[5:4] (which only affects fetch_tile_code's
+// post-fetch composition, not PROM addressing) is unaffected since
+// fetch_tile_code always recomputes from the live gfxbank every time
+// regardless of whether prom_byte_next came from a fresh fetch or the
+// cache.
+// 2026-07-26 REPLACEMENT: the single-entry cache above achieved a measured
+// hit rate of EXACTLY ZERO on real hardware -- the overlay's PM counter read
+// 0x2800 = 10240 = 40 tile columns x 256 lines, i.e. one miss per fetch, every
+// fetch, all frame. The reason is structural: the fetch cursor advances 8
+// pixels per arm, so tile_col_tgt (= eff_x_tgt[10:3]) INCREMENTS between
+// consecutive fetches. The same tile is not revisited until 8 scanlines
+// later, by which point the one slot has been overwritten ~40 times. The
+// "7 out of 8 scanlines" reuse the comment above describes can only happen
+// with one entry PER COLUMN, so that is what this is: a 256-entry line cache
+// indexed by tile column, tagged with {gfxbank[3], row}.
+//
+// No invalidation path is needed, for the same reason the gfx-plane cache
+// below needs none: ADDR_PROM_BASE (leland_board_pkg.sv:110) is populated
+// only by the ioctl ROM loader and is read-only for the session -- the CPU
+// has no write path to it, and background changes come from gfxbank banking
+// (which is in the tag), not from tilemap writes. Verified before widening
+// the cache, since a multi-entry cache holds entries far longer than the
+// single-entry one did and would expose any staleness the old one hid by
+// never hitting at all.
+localparam integer PROM_LC_N = 256;
+reg [16:0]           prom_lc_mem [0:PROM_LC_N-1]; // {bank3, row[7:0], byte[7:0]}
+reg [16:0]           prom_lc_q;                   // registered read, valid the cycle after
+reg [PROM_LC_N-1:0]  prom_lc_valid;               // flops, so reset clears every entry at once
 reg [7:0] bg_color_cur;
 // Named by which THIRD of bg_gfx they came from, not by plane-bit weight --
 // the two are reversed here, see the bg_pen assign below.
 reg [7:0] bg_third0_cur, bg_third1_cur, bg_third2_cur;
-reg [16:0] gfx_addr_r, prom_addr_r;
-reg        fetch_armed;
+
+// 2026-07-22 deep-prefetch redesign (see docs/planning_video_sdram_prefetch.md):
+// real hardware measured 40-79 clk_sys cycles per single SDRAM round-trip,
+// and a tile-row needs up to 3 serialized round-trips -- 120-237 cycles
+// against the old single-tile-ahead 54-cycle budget, a 2.2x-4.4x deficit
+// that fully explains the near-100%-of-fetches miss rate seen on real
+// hardware (a bring-up-only stale-commit diagnostic, since removed,
+// showed this saturating within ~2 frames).
+// Shaving reads (PROM cache) or gating garbage commits (commit-gate) both
+// remain necessary but cannot close a gap that size -- the fetch pipeline's
+// lookahead has to be several tile-widths deep, decoupled from the tight
+// per-scanline commit schedule, so a fetch has genuine slack to finish even
+// at bad-case real latency. Replaces the old single-slot "armed" scheme
+// (fetch_armed + *_next holding regs) with an N-deep ring buffer: the
+// producer (the fetch_ph FSM below) keeps it as full as it can, running
+// ahead of the display's actual consumption point; the display-side commit
+// just pops the next entry instead of checking a single in-flight fetch.
+localparam RBUF_N = 4'd8; // ring buffer depth (2-4x margin over the worst
+                          // measured 3-read/tile-row deficit above)
+reg [7:0] rbuf_color [0:7];   // only [2:0] meaningful, stored as a byte for
+                              // simplicity/uniformity with the other planes
+reg [7:0] rbuf_third0[0:7];
+reg [7:0] rbuf_third1[0:7];
+reg [7:0] rbuf_third2[0:7];
+reg [2:0] rbuf_wr, rbuf_rd;   // 3-bit pointers into the 8-deep buffer --
+                              // wrap naturally on overflow, no modulo needed
+reg [3:0] rbuf_count;         // 0..8
+assign rbuf_count_out = rbuf_count;
+
+wire [7:0] rbuf_color_rd  = rbuf_color [rbuf_rd];
+wire [7:0] rbuf_third0_rd = rbuf_third0[rbuf_rd];
+wire [7:0] rbuf_third1_rd = rbuf_third1[rbuf_rd];
+wire [7:0] rbuf_third2_rd = rbuf_third2[rbuf_rd];
+wire       rbuf_has_data  = (rbuf_count != 4'd0);
+wire       rbuf_has_room  = (rbuf_count != RBUF_N);
+
+// The producer's own walk cursor: the (hc,vc) position of the tile-row
+// most recently armed/in-flight, i.e. one step behind "the next position
+// to target". While the buffer is empty, the walk resyncs to the live
+// display position (hc+8, same lead the old single-slot scheme used) so
+// a scroll_x/scroll_y/gfxbank change is picked up as fast as possible;
+// once entries are queued, each new arm continues the walk from the LAST
+// queued target instead, advancing by one more 8-pixel tile-width every
+// time -- this is what makes the lookahead run several tiles deep instead
+// of just one. (A queued entry's tile position is therefore only as fresh
+// as the scroll/gfxbank values live when IT was armed, not when it's
+// finally displayed -- for a several-tile-deep queue that means a few
+// tiles' worth of transient staleness right after a scroll/bank change,
+// same class of tradeoff any deep prefetch makes; the old scheme had this
+// too, just with one tile of depth instead of up to eight.)
+reg [9:0] walk_hc;
+reg [8:0] walk_vc;
+
+// Row-boundary resync (2026-07-23, boot-hang fix): the walk cursor above
+// only ever resyncs to the live hc/vc when the ring buffer is fully
+// empty, which -- per the drift-tracking comment on base_hc/base_vc
+// below -- is rare-to-never in steady state, so a one-time miscount
+// (observed: right after the very first post-video_release fill burst)
+// has no other opportunity to correct itself and persists losslessly
+// forever, exactly the "walk cursor ran ~166 lines ahead of the real
+// display" symptom documented there. This forces one resync per real
+// display row regardless of buffer occupancy, bounding any such drift
+// to under one row as that comment's own proposed fix describes, without
+// touching the fine-scroll pop-timing logic that broke on the two prior
+// (reverted) attempts at fixing this the other way.
+reg [8:0] row_resync_vc_r;
+reg       row_resync_pending;
 
 wire [11:0] fetch_tile_code = {gfxbank[5:4], fetch_row[7:6], prom_byte_next};
 
-assign gfx_addr  = gfx_addr_r;
-assign prom_addr = prom_addr_r;
+// SDRAM byte addresses for this tile's 4 fetches -- same tile-code/row
+// math the old BRAM-address computation used, just added onto the
+// package's canonical region bases instead of driving a BRAM-local
+// address. gfxbank[3] selects the PROM's bank-1 half (bit 13 of its
+// offset), same as before.
+wire [16:0] prom_offset = leland_tile_idx(fetch_col, fetch_row) | {3'b0, gfxbank[3], 13'b0};
 
-// Blanking-aware fetch target (2026-07-14 bg-pipeline audit): the arm
-// fires at col_in_tile==4 (mid-tile) and its commit (col_in_tile==0)
-// lands exactly 4 hc-ticks later. The old code always fetched
-// "tile_col+1, current tile_row" -- correct while the commit lands
-// inside the same row's active area, but wrong for the last commit of
-// each scanline: that committed tile stays displayed across the
-// hc-wrap into the FIRST visible pixels of the NEXT row (the tilemap
-// source coordinate jumps discontinuously at the wrap -- eff_x from
-// ~scroll_x+420 back to scroll_x, eff_y advancing one line -- so no
-// single fetched tile can cover both sides; the pre-wrap side is
-// blanked, so the next row's side is the one that matters), yet the
-// fetch had targeted the old row's blanking-region continuation. The
-// isolated-TB frame diff against a software reference model
-// (sim/bg_reference.py, MAME leland_v.cpp math recomputed from the
-// ROM files) showed exactly this: the entire leftmost partial tile of
-// EVERY row rendered as a stale wrong tile, at every scroll_x fine
-// offset tested ({0,3,5}).
+wire [24:0] prom_sdram_addr = ADDR_PROM_BASE[24:0] + {8'b0, prom_offset};
+
+// Wider-reads bandwidth optimization (2026-07-22, see docs/
+// planning_video_sdram_prefetch.md and rtl/sor_board.sv's gfx-repack
+// FSM): planes 0+1 are pre-interleaved into 16-bit words at
+// ADDR_GFXW_BASE (word i = {plane1[i], plane0[i]}, i = tile_code*8+riy,
+// exactly the same 15-bit index either raw plane used alone). Superseded
+// as of WP-M8 by the ADDR_GFXROW_BASE burst read below for the actual
+// fetch path, but ADDR_GFXW_BASE itself is left populated/untouched (the
+// repack FSM still writes it) in case anything else ever wants a plain
+// 16-bit two-plane read without pulling in plane2.
+wire [14:0] gfx01_idx = {fetch_tile_code, fetch_riy};
+
+// WP-M8 (2026-07-24, docs/planning_sdram_multichannel.md §12 "Video
+// re-encoding"): single burst read of the ADDR_GFXROW_BASE packed entry
+// (word0={plane1,plane0}, word1={8'h00,plane2} -- see
+// leland_board_pkg.sv's ADDR_GFXROW_BASE comment) replaces the old
+// separate FP_GFX01_REQ/WAIT + FP_GFX2_REQ/WAIT sequence -- one SDRAM
+// transaction (BURST_LEN=2 burst, sdram_ctrl instantiated accordingly in
+// rtl/sor_board.sv) instead of two, safely wired via WP-M8 step 1's
+// dout_b0/burst_words[0] migration. Address is inherently BURST_LEN=2-
+// column-aligned since ADDR_GFXROW_BASE and the *4 stride are both
+// multiples of 4 bytes (2 words).
 //
-// General rule replacing the "+1, same row" heuristic, three cases on
-// the commit position hc+4:
-//   active (hc+4 < H_ACTIVE): target hc+4 on the current row --
-//     provably identical to the old "tile_col+1, same row" here.
-//   blanking (H_ACTIVE <= hc+4 < H_TOTAL): the commit itself is
+// Third time's the charm (2026-07-24): the first two attempts at this
+// exact change were reverted after sim/sor_video_tb.sv + bg_reference.py
+// showed a large pixel diff -- root-caused (see base_hc's own comment
+// below) to a COMPLETELY UNRELATED pre-existing bug in the ring-buffer's
+// row-resync logic (a 7-tile horizontal shift, present with or without
+// this GFXROW change). That bug is now fixed. Re-tested clean: race/
+// winners/track2 all 0.00% diff with this change applied.
+wire [24:0] gfxrow_sdram_addr = ADDR_GFXROW_BASE[24:0] + {gfx01_idx, 2'b00};
+
+// Tile-row gfx-plane cache (2026-07-22, post-hardware-bringup follow-up
+// to the wider-reads fix -- see docs/planning_video_sdram_prefetch.md):
+// modeled on Darius_MiSTer's tile_rom_arbiter.sv, a 256-entry direct-
+// mapped cache over gfx01_idx (= {tile_code, riy}, the same 15-bit
+// address wider-reads already uses), storing all 3 plane bytes for a
+// tile-row together. A hit skips BOTH remaining SDRAM reads (gfx01 and
+// gfx2) entirely -- not just shrinking the transaction like wider reads
+// did, but eliminating it -- because this design's own gfxbank[5:4]
+// bits are already folded into tile_code (see fetch_tile_code above),
+// so distinct banks/tiles naturally land in distinct cache slots with
+// no separate invalidation logic needed; and because bg_gfx is a
+// read-only ROM for the whole session, a cached entry is valid forever
+// once populated -- no coherency/staleness concern at all. Given how
+// much a scrolling tilemap reuses the same handful of terrain tiles,
+// this should cut rd2 traffic (and therefore its remaining pressure on
+// CPU/sound bus time, per the arbiter-boost zero-sum finding) well
+// below what wider reads alone achieved.
+//
+// M10K inference (2026-07-22 follow-up): a single 256x32 array --
+// {valid(1), tag(7), b0(8), b1(8), b2(8)} -- with a plain synchronous
+// write port and a REGISTERED read port (address presented one cycle,
+// data captured the next, standard simple-dual-port BRAM timing), split
+// into its own always block below. The first cut of this cache used 5
+// separate combinationally-read arrays with a one-shot 256-wide
+// synchronous clear, which is a pattern Quartus doesn't map onto M10K
+// (no per-bit clear on real block RAM) -- it fell back to registers/
+// ALMs (confirmed: block memory bits unchanged in the fit report, ALM
+// usage jumped by ~8200, matching the array size almost exactly).
+// Clearing now happens by WRITING zero to each address in turn over the
+// first 256 cycles of reset instead of an all-at-once clear -- sor_video
+// stays in reset for the entire ROM-load + gfx-repack boot window (far
+// more than 256 clk_sys cycles), so there's no time pressure. The
+// registered read adds exactly one clk_sys cycle of latency per tile
+// fetch (FP_GFX_LOOKUP below) regardless of hit or miss -- negligible
+// against the ~54-cycle tile budget.
+localparam [31:0] GFXCACHE_INVALID = 32'd0; // valid bit is bit 31, 0 = invalid
+reg [31:0] gfxcache_mem [0:255];
+reg  [7:0] gfxcache_clear_idx;
+reg        gfxcache_wr_en;
+reg  [7:0] gfxcache_wr_addr;
+reg [31:0] gfxcache_wr_data;
+reg [31:0] gfxcache_rd_data_r;
+
+wire [7:0] gfx_cache_idx = gfx01_idx[7:0];
+wire [6:0] gfx_cache_tag = gfx01_idx[14:8];
+wire       gfx_cache_hit  = gfxcache_rd_data_r[31] && (gfxcache_rd_data_r[30:24] == gfx_cache_tag);
+wire [7:0] gfxcache_b0_rd = gfxcache_rd_data_r[23:16];
+wire [7:0] gfxcache_b1_rd = gfxcache_rd_data_r[15:8];
+wire [7:0] gfxcache_b2_rd = gfxcache_rd_data_r[7:0];
+
+always @(posedge clk_sys) begin
+	if (reset) begin
+		gfxcache_clear_idx <= (gfxcache_clear_idx == 8'hFF) ? gfxcache_clear_idx : (gfxcache_clear_idx + 8'd1);
+		gfxcache_mem[gfxcache_clear_idx] <= GFXCACHE_INVALID;
+	end else begin
+		gfxcache_clear_idx <= 8'd0;
+		if (gfxcache_wr_en) gfxcache_mem[gfxcache_wr_addr] <= gfxcache_wr_data;
+	end
+	// Read port: address is the live (combinational) gfx_cache_idx every
+	// cycle; only meaningful the cycle fetch_ph==FP_GFX_LOOKUP presents
+	// it, captured here and consumed the FOLLOWING cycle in FP_GFX01_REQ.
+	gfxcache_rd_data_r <= gfxcache_mem[gfx_cache_idx];
+end
+
+reg         sdram_rd2_req_r;
+reg  [24:0] sdram_rd2_addr_r;
+assign sdram_rd2_req  = sdram_rd2_req_r;
+assign sdram_rd2_addr = sdram_rd2_addr_r;
+
+// Blanking-aware fetch target (2026-07-14 bg-pipeline audit, re-derived
+// 2026-07-20 for WP-L2's LEAD=8): the arm fires at col_in_tile==0
+// (tile start) and its commit (col_in_tile==0 of the NEXT tile) lands
+// exactly 8 hc-ticks later -- doubled from LEAD=4's mid-tile arm/4-tick
+// window now that the 4 sequential fetches go to SDRAM (see the arm-
+// point comment above). The original bug this logic fixes -- a naive
+// "always fetch tile_col+1, same row" rule renders the leftmost
+// partial tile of every scanline as stale/wrong -- and its fix are
+// unchanged in kind; only the constant changes. The general rule
+// (commit position hc+8, three cases) is derived purely from where
+// commit_pos falls relative to H_ACTIVE/H_TOTAL, so it generalizes to
+// any LEAD without re-deriving the case split itself:
+//   active (hc+8 < H_ACTIVE): target hc+8 on the current row --
+//     the tile that will occupy screen column hc+8 when its window
+//     opens, exactly as LEAD=4 targeted hc+4.
+//   blanking (H_ACTIVE <= hc+8 < H_TOTAL): the commit itself is
 //     invisible; the tile's only possible visible coverage is the
 //     START of the next row, so target (0, vc+1). All blanking arms
-//     then redundantly refetch that same row-start tile (harmless).
-//   wrapped (hc+4 >= H_TOTAL): the commit lands at hc+4-H_TOTAL on
-//     the next row -- which is ACTIVE (0..7), not necessarily 0:
-//     scroll_x fine offsets {0,5,6,7} place the final arm of a row at
-//     hc 420..423, whose commit covers next-row pixels starting at
-//     1..3 -- the second visible tile, NOT the row-start tile (the
-//     row-start tile came from the blanking commits before it).
-//     Targeting 0 here (a first, simpler version of this fix) left
-//     the second visible tile of every row stale for fine offsets
-//     {5,6,7}, caught by the finex5 TB case's reference diff.
-wire  [9:0] commit_pos      = hc + 10'd4;
+//     then redundantly refetch that same row-start tile (harmless) --
+//     unchanged from LEAD=4.
+//   wrapped (hc+8 >= H_TOTAL): the commit lands at hc+8-H_TOTAL on the
+//     next row. H_TOTAL-H_ACTIVE=104 pixels of blanking comfortably
+//     exceeds LEAD=8, so a wrapped commit can only ever land once
+//     into the next row (hc max 423 + 8 = 431 < 2*H_TOTAL), same as
+//     LEAD=4's single-wrap guarantee. The wrapped range widens from
+//     LEAD=4's {1..3} to {0..7} (hc 416..423 -> commit 424..431 ->
+//     wrapped 0..7): this now OVERLAPS the blanking case's fixed
+//     target of column 0 for some scroll_x fine offsets -- both paths
+//     agreeing on the same row-start tile in that overlap is harmless
+//     redundancy, not a new case; the {0..7} range still resolves to
+//     at most two distinct visible tiles via tile_col_tgt's own
+//     eff_x_tgt[10:3] division, exactly as LEAD=4's narrower {1..3}
+//     range did. No new case beyond the original three is needed.
+// base_hc/base_vc: the position the NEXT arm's target is 8 pixels ahead
+// of. Empty buffer -> resync to the live display position (hc), exactly
+// the old scheme's lead. Non-empty -> continue from the walk cursor (the
+// last-armed target), so successive arms step 8 pixels further ahead each
+// time instead of all targeting the same spot.
+//
+// 2026-07-24 fix: row_resync_pending (added 2026-07-23 for the boot-hang
+// fix) forced this SAME "hc, zero backlog" reset whenever a new display
+// row starts, regardless of whether the buffer still holds queued
+// entries -- but direct sim measurement (sim/sor_video_tb.sv +
+// bg_reference.py showing a clean, scroll-independent 56px/7-tile
+// horizontal shift, confirmed NOT a settle-timing artifact) proved the
+// buffer is reliably FULL (rbuf_count==RBUF_N) at the exact instant a new
+// row starts in steady state -- this producer greedily fills all the way
+// to RBUF_N deep (see the walk-cursor comment above: "makes the lookahead
+// run several tiles deep instead of just one"), not just 1 tile ahead.
+// The row-resync's "+8" (via commit_pos below) assumed this newly-armed
+// entry would be displayed almost immediately (the TRUE empty-buffer
+// case's assumption) -- but it actually lands behind however many entries
+// are still queued, and isn't displayed until that many pop cycles later,
+// by which point the real hc has advanced rbuf_count tile-widths further
+// than this entry was computed for. Confirmed numerically: measured
+// rbuf_count==7 at the exact resync instant, 7*8=56 == the measured
+// shift, exactly. Fix: only assume zero backlog when the buffer is
+// GENUINELY empty; when row_resync_pending fires with entries still
+// queued, advance past them (+8 per already-queued entry) instead of
+// resetting to bare hc.
+wire  [9:0] base_hc = (rbuf_has_data && !row_resync_pending) ? walk_hc :
+                      rbuf_has_data ? (hc + {3'd0, rbuf_count, 3'd0}) : hc;
+wire  [8:0] base_vc = (rbuf_has_data && !row_resync_pending) ? walk_vc : vc;
+
+wire  [9:0] commit_pos      = base_hc + 10'd8;
 wire        commit_wraps    = (commit_pos >= H_TOTAL);
 wire        commit_in_blank = !commit_wraps && (commit_pos >= H_ACTIVE);
 wire  [9:0] hc_tgt  = commit_wraps    ? (commit_pos - H_TOTAL) :
                       commit_in_blank ? 10'd0 : commit_pos;
 wire  [8:0] vc_tgt  = (commit_wraps || commit_in_blank)
-                      ? ((vc == V_TOTAL - 1'd1) ? 9'd0 : vc + 1'd1) : vc;
+                      ? ((base_vc == V_TOTAL - 1'd1) ? 9'd0 : base_vc + 1'd1) : base_vc;
 wire [10:0] eff_x_tgt = hc_tgt + scroll_x[10:0];
 wire [10:0] eff_y_tgt = {2'b0, vc_tgt} + scroll_y[10:0];
 wire  [7:0] tile_col_tgt = eff_x_tgt[10:3];
 wire  [7:0] tile_row_tgt = eff_y_tgt[10:3];
 
+// walk_hc_store: what gets latched into the walk cursor for the NEXT
+// continuation step -- distinct from hc_tgt itself only in the
+// commit_in_blank case. hc_tgt==0 there is correct for THIS push (it's
+// screen column 0, whatever tile that scrolls to), but a non-zero
+// scroll_x fine offset means the real second col_in_tile==0 boundary of
+// the new row lands at hc=(8-fine), not hc=8: continuing the chain with
+// a flat "0, then +8" loses the fine-offset phase from the second tile
+// of every row onward (found via the finex3/5/6/7 fine-scroll-offset
+// regression cases -- race/winners/track2 all use 8-aligned scroll_x
+// and so never exercised this). (8-fine)&7 reduces to plain 0 when
+// fine==0, so the aligned cases are unaffected.
+wire [2:0] scroll_x_fine     = scroll_x[2:0];
+wire [9:0] blank_wrap_next_hc = (10'd8 - {7'd0, scroll_x_fine}) & 10'd7;
+wire [9:0] walk_hc_store = commit_in_blank ? blank_wrap_next_hc : hc_tgt;
+
+// Line-cache lookup. prom_lc_q is registered off the LIVE tile_col_tgt every
+// cycle, so during FP_PROM_LOOKUP (one cycle after the arm that latched
+// fetch_col <= tile_col_tgt) it holds exactly mem[fetch_col]. The valid bit
+// is a flop array rather than a RAM bit so reset clears all 256 at once --
+// RAM contents are undefined at power-up and would otherwise false-hit.
+wire prom_lc_hit = prom_lc_valid[fetch_col]
+                  && (prom_lc_q[16]   == gfxbank[3])
+                  && (prom_lc_q[15:8] == fetch_row);
+
+// fetch_ph encoding: 0=idle, odd=issue request for this byte, even=wait
+// for sdram_rd2_ack. Unlike the old fixed-latency BRAM scheme (address-
+// set phase + dedicated wait phase + capture-on-next-phase), each REQ
+// phase holds sdram_rd2_req_r high until sdram_rd2_ack arrives -- the
+// SDRAM channel's latency varies with arbitration wait, so this is a
+// genuine handshake, not a fixed cycle count.
+localparam FP_IDLE        = 4'd0,
+           FP_PROM_LOOKUP = 4'd7, // present prom_lc index to the registered-read line-cache RAM
+           FP_PROM_REQ    = 4'd1, FP_PROM_WAIT   = 4'd2,
+           FP_GFX_LOOKUP  = 4'd3, // present gfx_cache_idx to the registered-read cache RAM this cycle
+           FP_GFXROW_REQ  = 4'd4, // gfxcache_rd_data_r now valid -- check hit/miss here
+           FP_GFXROW_WAIT = 4'd5, // WP-M8: single burst read replaces old FP_GFX01+FP_GFX2 pair
+           FP_GFXCACHED   = 4'd6; // gfx_cache_hit at FP_GFXROW_REQ -- push next cycle, no SDRAM needed
+
+assign fetch_busy = (fetch_ph != FP_IDLE);
+
+// Ring-buffer push/pop: a fetch completes (last gfx byte acked) and a
+// display tile-boundary wants the next entry, evaluated independently
+// every clk_sys cycle -- can coincide (net buffer occupancy unchanged)
+// without conflict since each drives its own pointer.
+//
+// fifo_pop_req is gated to hc<H_ACTIVE (2026-07-22, found via sim
+// pixel-diff regression after the initial ring-buffer draft showed
+// ~90%+ diff on every case): col_in_tile==0 keeps firing roughly every
+// 8 pixels through the ~104-pixel HBlank tail too (~13 extra events per
+// scanline), not just across the 320 active pixels. The OLD single-slot
+// scheme could ignore this -- each of those extra events re-armed off
+// LIVE hc, which was still inside blanking every time, so they all
+// harmlessly re-targeted the exact same (0, vc+1) tile over and over.
+// This ring buffer's producer instead chains forward from its own walk
+// cursor once armed, so as soon as that cursor's first post-wrap step
+// lands on hc_tgt==0 (< H_ACTIVE), every following continuation step is
+// the ACTIVE case again -- each of those ~13 "redundant" blanking pops
+// was draining one genuinely-distinct, already-produced future tile
+// instead of a harmless repeat, so the producer kept re-filling ~13
+// tiles further into the NEXT row every single scanline. That's a
+// runaway compounding drift (confirmed in sim: the walk cursor's target
+// row ran ~166 lines ahead of the real display within under a third of
+// a frame) with no self-correction, since the buffer never actually
+// empties in steady state. Restricting pops to the 320 real active
+// pixels (hc==0,8,...,312 -- exactly the 40 tiles/row that get
+// displayed) makes exactly one pop happen per one push needed, keeping
+// the walk cursor's lead bounded by the buffer depth as intended.
+// KNOWN LIMITATION (2026-07-22, tracked for follow-up): a non-8-aligned
+// scroll_x fine offset means a row touches 41 distinct tiles, not 40
+// (both screen edges can show a partial tile), and this pop gate as
+// written only fires 40 times/row -- the leftmost partial tile's own
+// col_in_tile==0 crossing lands during the PREVIOUS row's HBlank (hc>=
+// H_ACTIVE), which is deliberately excluded below (see comment) to fix
+// a worse bug. Two same-session attempts to also pop once at hc==0 (to
+// pick up that 41st tile) were tried and reverted:
+//   1st attempt broke the previously-clean 8-aligned cases
+//      (switch_race_to_winners regressed from 0.00% to 68% diff).
+//   2nd attempt (tagging each ring-buffer entry with its real fetch_col/
+//      fetch_row and comparing against ground truth at pop time, rather
+//      than inferring correctness from hc/vc alone) proved the ALIGNED
+//      cases broke too, and precisely why: at the exact frame-boundary
+//      instant, the buffer's front entries were still tiles from ~33
+//      columns further into a PRIOR pass over the SAME row (col=74..80
+//      instead of the expected 41..47) -- a genuine, non-transient
+//      several-tile phase lag between the walk cursor's logical position
+//      and the FIFO's actual front, NOT a same-cycle race as first
+//      suspected: aggregate push/pop counts balance exactly over any
+//      window (confirmed 9839/9839 across a full captured frame), so
+//      whatever caused the lag happened once, early, and then persisted
+//      losslessly rather than growing or self-correcting. Root cause not
+//      yet isolated further (candidate: the walk cursor only ever
+//      resyncs to live hc/vc when the buffer is fully empty -- rare in
+//      steady state -- so a one-time miscount near reset/warm-up has no
+//      other opportunity to correct itself; a fix likely needs the
+//      producer to resync to live hc/vc once per ROW, not just on empty,
+//      bounding any such lag to under one row instead of letting it
+//      persist indefinitely). Net effect of leaving this unresolved: the
+// four scroll-register values actually captured from real MAME gameplay
+// (race/winners/track2/switch, all 8-aligned scroll_x) are byte-exact
+// (0.00% diff, sim/sor_video_tb.sv + sim/bg_reference.py); the
+// synthetic fine-offset stress cases (finex3/5/6/7) went from ~94% diff
+// (pre-fix) to ~3% diff (leftmost ~13 px/row wrong, everything else
+// correct) -- a large improvement, not a full fix. Real hardware scroll
+// deltas will hit non-aligned values during normal play, so this must
+// be resolved (or explicitly accepted as a narrow, small-glitch
+// regression against the pre-WP-L2 BRAM baseline) before calling this
+// done -- do not remove this comment until finex3/5/6/7 also hit 0.00%.
+// fifo_push covers both ways a tile-row finishes: the normal SDRAM
+// completion (FP_GFXROW_WAIT's ack) and a gfx-cache hit (FP_GFXCACHED,
+// one cycle after FP_GFXROW_REQ found gfx_cache_hit, no SDRAM wait
+// needed at all).
+wire fifo_push    = ((fetch_ph == FP_GFXROW_WAIT) && sdram_rd2_ack) || (fetch_ph == FP_GFXCACHED);
+wire fifo_pop_req = ce_pix && (col_in_tile == 3'd0) && (hc < H_ACTIVE);
+wire fifo_pop     = fifo_pop_req && rbuf_has_data;
+
+//------------------------------------------------------------------
+// Debug-overlay instrumentation, part 1: events only this module can
+// see directly (prom_cache_valid/fetch_ph are private to the fetch
+// FSM below). Two per-tile events:
+//
+//   prom_cache_miss_ev: fires the same cycle a new tile-row fetch is
+//     armed and prom_cache_hit was false, i.e. a real cache miss on
+//     the (col,row,gfxbank[3]) key at rtl/sor_video.sv:276-278's
+//     prom_cache_valid/_col/_row/_bank3. NOTE (2026-07-25 amendment):
+//     this cache's key does not include tile index, so ordinary
+//     background content changing frame-to-frame does NOT invalidate
+//     it -- only col/row/gfxbank[3] changing does. This counter tests
+//     the gfxbank-cycling variant of the starvation hypothesis, not
+//     the original (weaker) one.
+//   tile_deadline_miss: fires when a complete tile-row fetch (PROM +
+//     GFXROW, i.e. arm-to-fifo_push) took more than TILE_DEADLINE_
+//     CYCLES clk_sys cycles -- mirrors sim/sor_board_tb.sv's
+//     TILE_FETCH_DEADLINE_MISS (RD2_DEADLINE_CYCLES=54) so the two
+//     numbers are directly comparable to earlier sim measurements.
+//------------------------------------------------------------------
+wire fetch_arm = (fetch_ph == FP_IDLE) && rbuf_has_room;
+// Evaluated one cycle later than the arm now (the line-cache RAM read is
+// registered), so this fires in FP_PROM_LOOKUP rather than at arm time --
+// still exactly one event per fetch, so PM stays directly comparable to the
+// pre-line-cache readings.
+wire prom_cache_miss_ev = (fetch_ph == FP_PROM_LOOKUP) && !prom_lc_hit;
+
+localparam [8:0] TILE_DEADLINE_CYCLES = 9'd54;
+reg [8:0] fetch_cyc_cnt;
+reg       fetch_active;
+wire      tile_deadline_miss = fifo_push && fetch_active && (fetch_cyc_cnt > TILE_DEADLINE_CYCLES);
+
 always @(posedge clk_sys) begin
 	if (reset) begin
-		fetch_ph    <= 4'd0;
-		fetch_armed <= 1'b0;
+		fetch_cyc_cnt <= 9'd0;
+		fetch_active  <= 1'b0;
 	end else begin
-		if (ce_pix) begin
-			if ((col_in_tile == 3'd4) && !fetch_armed && (fetch_ph == 4'd0)) begin
-				fetch_armed <= 1'b1;
-				fetch_col   <= tile_col_tgt;
-				fetch_row   <= tile_row_tgt;
-				fetch_riy   <= eff_y_tgt[2:0];
-				fetch_ph    <= 4'd1;
-			end else if (col_in_tile != 3'd4) begin
-				fetch_armed <= 1'b0;
-			end
+		if (fetch_arm) begin
+			fetch_active  <= 1'b1;
+			fetch_cyc_cnt <= 9'd0;
+		end else if (fetch_active && !fifo_push) begin
+			fetch_cyc_cnt <= (fetch_cyc_cnt == 9'h1FF) ? fetch_cyc_cnt : fetch_cyc_cnt + 9'd1;
+		end
+		if (fifo_push) fetch_active <= 1'b0;
+	end
+end
 
-			// Commit the previously-fetched tile at the start of its display window
-			if (col_in_tile == 3'd0) begin
-				bg_color_cur   <= prom_byte_next[7:5];
-				bg_third0_cur  <= gfx0_next;
-				bg_third1_cur  <= gfx1_next;
-				bg_third2_cur  <= gfx2_next;
-			end
+`ifndef ALTERA_RESERVED_QIS
+// Sim-only (2026-07-26): direct hit-rate measurement for the line cache.
+// Inferring the hit rate from total rd2 traffic proved unreliable -- measure
+// it at the source instead.
+integer dbg_arm_cnt = 0, dbg_lc_hit = 0, dbg_lc_miss = 0;
+always @(posedge clk_sys) begin
+	// !reset is essential: during the long ROM-load reset the FSM is pinned
+	// in FP_IDLE with rbuf_has_room true, so fetch_arm is high EVERY cycle
+	// and an unmasked count reads ~6.2M against ~19k real fetches.
+	if (fetch_arm && !reset) dbg_arm_cnt <= dbg_arm_cnt + 1;
+	if (fetch_ph == FP_PROM_LOOKUP) begin
+		if (prom_lc_hit) dbg_lc_hit  <= dbg_lc_hit  + 1;
+		else             dbg_lc_miss <= dbg_lc_miss + 1;
+	end
+end
+final $display("%m PROM_LC_SUMMARY: arms=%0d hits=%0d misses=%0d", dbg_arm_cnt, dbg_lc_hit, dbg_lc_miss);
+`endif
+
+// PROM line cache RAM. Read address is the LIVE tile_col_tgt every cycle, so
+// prom_lc_q is always "the entry for whatever column was targeted last
+// cycle" -- which during FP_PROM_LOOKUP is precisely fetch_col. Fill fires on
+// the same FP_PROM_WAIT ack that latches prom_byte_next, so fetch_col /
+// fetch_row / gfxbank[3] / sdram_rd2_data are all live and consistent here.
+wire prom_lc_fill = (fetch_ph == FP_PROM_WAIT) && sdram_rd2_ack;
+
+always @(posedge clk_sys) begin
+	if (prom_lc_fill) prom_lc_mem[fetch_col] <= {gfxbank[3], fetch_row, sdram_rd2_data};
+	prom_lc_q <= prom_lc_mem[tile_col_tgt];
+end
+
+always @(posedge clk_sys) begin
+	if (reset)             prom_lc_valid <= '0;
+	else if (prom_lc_fill) prom_lc_valid[fetch_col] <= 1'b1;
+end
+
+always @(posedge clk_sys) begin
+	if (reset) begin
+		fetch_ph         <= FP_IDLE;
+		sdram_rd2_req_r  <= 1'b0;
+		rbuf_wr          <= 3'd0;
+		rbuf_rd          <= 3'd0;
+		rbuf_count       <= 4'd0;
+		gfxcache_wr_en   <= 1'b0;
+		row_resync_vc_r    <= 9'd0;
+		row_resync_pending <= 1'b1;
+	end else begin
+		gfxcache_wr_en   <= 1'b0;
+
+		// Row-boundary resync tracker: arm a forced live-hc/vc resync the
+		// moment vc changes (a new display row has started), so the next
+		// producer arm below uses reality instead of blindly continuing
+		// the walk cursor -- see the row_resync_pending declaration
+		// comment above for why this is needed.
+		if (vc != row_resync_vc_r) begin
+			row_resync_vc_r    <= vc;
+			row_resync_pending <= 1'b1;
 		end
 
-		// Each BRAM read (sor_board.sv's prom_rom/gfx_rom) is a standard
-		// single-cycle synchronous read: the address must be stable for
-		// one full clk_sys cycle before the registered data output
-		// reflects it. Every address-set phase below is therefore
-		// followed by a dedicated wait phase before the data is
-		// captured -- capturing on the very next cycle (as an earlier
-		// version of this FSM did) reads back stale data one fetch
-		// behind, since the new address hasn't reached the BRAM's
-		// output register yet.
+		// Producer: keep the ring buffer as full as possible, decoupled
+		// from ce_pix/col_in_tile -- runs every clk_sys cycle whenever the
+		// FSM is idle and there's room, instead of arming exactly once per
+		// tile-display-window like the old single-slot scheme.
+		if ((fetch_ph == FP_IDLE) && rbuf_has_room) begin
+			fetch_col <= tile_col_tgt;
+			fetch_row <= tile_row_tgt;
+			fetch_riy <= eff_y_tgt[2:0];
+			walk_hc   <= walk_hc_store;
+			walk_vc   <= vc_tgt;
+			row_resync_pending <= 1'b0;
+			// PROM re-fetch elimination: always spend one cycle in
+			// FP_PROM_LOOKUP so the line-cache RAM read (registered off
+			// tile_col_tgt this cycle) is valid to test next cycle. That one
+			// cycle replaces a full SDRAM round-trip on every hit -- measured
+			// at 40-79 clk_sys cycles apiece -- so it pays for itself many
+			// times over even at a modest hit rate.
+			fetch_ph  <= FP_PROM_LOOKUP;
+		end
+
+		// Consumer: pop the next queued tile-row at the start of its
+		// display window. An empty buffer (real underrun -- should now be
+		// rare given the deep lookahead) falls back to holding the
+		// previous tile, same benign failure mode the old commit-gate
+		// introduced.
+		if (fifo_pop_req && rbuf_has_data) begin
+			bg_color_cur   <= rbuf_color_rd[7:5];
+			bg_third0_cur  <= rbuf_third0_rd;
+			bg_third1_cur  <= rbuf_third1_rd;
+			bg_third2_cur  <= rbuf_third2_rd;
+		end
+
+		if (fifo_push && !fifo_pop) rbuf_count <= rbuf_count + 4'd1;
+		else if (!fifo_push && fifo_pop) rbuf_count <= rbuf_count - 4'd1;
+		if (fifo_push) rbuf_wr <= rbuf_wr + 3'd1;
+		if (fifo_pop)  rbuf_rd <= rbuf_rd + 3'd1;
+
 		case (fetch_ph)
-			4'd1: begin
-				prom_addr_r <= leland_tile_idx(fetch_col, fetch_row) | {3'b0, gfxbank[3], 13'b0};
-				fetch_ph    <= 4'd2;
+			FP_PROM_LOOKUP: begin
+				// prom_lc_q/prom_lc_valid are valid now. A hit reuses the
+				// cached PROM byte and skips the SDRAM round-trip entirely.
+				if (prom_lc_hit) begin
+					prom_byte_next <= prom_lc_q[7:0];
+					fetch_ph       <= FP_GFX_LOOKUP;
+				end else begin
+					fetch_ph       <= FP_PROM_REQ;
+				end
 			end
-			4'd2: fetch_ph <= 4'd3; // wait: let prom_addr_r settle into the BRAM
-			4'd3: begin
-				prom_byte_next <= prom_data;
-				fetch_ph       <= 4'd4;
+			FP_PROM_REQ: begin
+				sdram_rd2_addr_r <= prom_sdram_addr;
+				sdram_rd2_req_r  <= 1'b1;
+				fetch_ph         <= FP_PROM_WAIT;
 			end
-			4'd4: begin
-				gfx_addr_r <= {2'd0, fetch_tile_code, fetch_riy};
-				fetch_ph   <= 4'd5;
+			FP_PROM_WAIT: if (sdram_rd2_ack) begin
+				prom_byte_next   <= sdram_rd2_data;
+				// line-cache fill happens in the RAM block below, off the
+				// same condition, so it uses the live sdram_rd2_data.
+				sdram_rd2_req_r  <= 1'b0;
+				fetch_ph         <= FP_GFX_LOOKUP;
 			end
-			4'd5: fetch_ph <= 4'd6; // wait: let gfx_addr_r (plane 0) settle
-			4'd6: begin
-				gfx0_next  <= gfx_data;
-				gfx_addr_r <= {2'd1, fetch_tile_code, fetch_riy};
-				fetch_ph   <= 4'd7;
+			FP_GFX_LOOKUP: begin
+				// fetch_tile_code/fetch_riy (via gfx01_idx) are valid this
+				// cycle regardless of which arm path got here (prom cache
+				// hit: prom_byte_next was already valid; fresh PROM fetch:
+				// updated last cycle in FP_PROM_WAIT). Nothing to do but
+				// let one cycle pass -- gfx_cache_idx is being presented to
+				// the registered-read cache RAM (see its always block)
+				// right now, so gfxcache_rd_data_r/gfx_cache_hit are valid
+				// starting next cycle, in FP_GFXROW_REQ.
+				fetch_ph <= FP_GFXROW_REQ;
 			end
-			4'd7: fetch_ph <= 4'd8; // wait: let gfx_addr_r (plane 1) settle
-			4'd8: begin
-				gfx1_next  <= gfx_data;
-				gfx_addr_r <= {2'd2, fetch_tile_code, fetch_riy};
-				fetch_ph   <= 4'd9;
+			FP_GFXROW_REQ: begin
+				// A hit needs no SDRAM access at all -- straight to a
+				// one-cycle push.
+				if (gfx_cache_hit) begin
+					fetch_ph <= FP_GFXCACHED;
+				end else begin
+					sdram_rd2_addr_r <= gfxrow_sdram_addr;
+					sdram_rd2_req_r  <= 1'b1;
+					fetch_ph         <= FP_GFXROW_WAIT;
+				end
 			end
-			4'd9: fetch_ph <= 4'd10; // wait: let gfx_addr_r (plane 2) settle
-			4'd10: begin
-				gfx2_next <= gfx_data;
-				fetch_ph  <= 4'd0;
+			FP_GFXROW_WAIT: if (sdram_rd2_ack) begin
+				// WP-M8: one BURST_LEN=2 transaction returns both packed
+				// words at once -- word0 (sdram_rd2_data16) = {plane1,
+				// plane0}, word1 (sdram_rd2_data16_hi) = {8'h00, plane2} --
+				// see leland_board_pkg.sv's ADDR_GFXROW_BASE comment. Both
+				// words are valid the same ack cycle (burst_words[0]/[1]
+				// captured back-to-back by sdram_banked, see its WP-M6/M8
+				// comments), so the whole tile-row can be pushed directly,
+				// no separate gfx0_next/gfx1_next latch needed any more.
+				rbuf_color [rbuf_wr] <= prom_byte_next;
+				rbuf_third0[rbuf_wr] <= sdram_rd2_data16[7:0];
+				rbuf_third1[rbuf_wr] <= sdram_rd2_data16[15:8];
+				rbuf_third2[rbuf_wr] <= sdram_rd2_data16_hi[7:0];
+				// Populate the gfx-plane cache for next time this exact
+				// (tile_code, riy) is needed -- gfx_cache_idx/tag are still
+				// valid here (same fetch_tile_code/fetch_riy this whole
+				// burst). bg_gfx is a read-only ROM for the session, so
+				// this entry never goes stale once written -- no
+				// invalidation path needed.
+				gfxcache_wr_en   <= 1'b1;
+				gfxcache_wr_addr <= gfx_cache_idx;
+				gfxcache_wr_data <= {1'b1, gfx_cache_tag, sdram_rd2_data16[7:0], sdram_rd2_data16[15:8], sdram_rd2_data16_hi[7:0]};
+				sdram_rd2_req_r      <= 1'b0;
+				fetch_ph             <= FP_IDLE;
+			end
+			FP_GFXCACHED: begin
+				// gfx_cache_hit fired last cycle at FP_GFXROW_REQ -- push
+				// straight from the cache, no SDRAM involved for this
+				// tile-row at all (fifo_push covers this state, see above).
+				rbuf_color [rbuf_wr] <= prom_byte_next;
+				rbuf_third0[rbuf_wr] <= gfxcache_b0_rd;
+				rbuf_third1[rbuf_wr] <= gfxcache_b1_rd;
+				rbuf_third2[rbuf_wr] <= gfxcache_b2_rd;
+				fetch_ph             <= FP_IDLE;
 			end
 			default: ;
 		endcase
@@ -682,128 +999,108 @@ wire [7:0] col_g = {cram_data[5:3], cram_data[5:3], cram_data[5:4]};
 wire [7:0] col_b = {cram_data[7:6], cram_data[7:6], cram_data[7:6], cram_data[7:6]};
 
 //------------------------------------------------------------------
-// Debug overlay — top 16 rows of the active area
+// Debug overlay (2026-07-25) -- see the port-list comment above for
+// scope/intent. Part 2: per-frame accumulate/freeze/render.
 //
-// Visible on screen without an IO board. Layout (320 px wide):
-//
-//  ┌──── 64 px ────┬────────── 128 px ──────────┬── remaining ──┐
-//  │  bank_reg     │  CPU activity heartbeat     │  (bars/black) │
-//  │  4 bits as    │  8-bit counter incremented  │               │
-//  │  16×16 blocks │  by dbg_cpu_active pulses,  │               │
-//  │               │  shown as a gradient bar    │               │
-//  └───────────────┴─────────────────────────────┴───────────────┘
-//
-// Bank register blocks (hc 0..63, vc 0..15):
-//   Each bit occupies 16 horizontal pixels.
-//   Bit clear → dark grey (#333)
-//   Bit set   → bright colour (bit0=red, bit1=green, bit2=blue, bit3=white)
-//   If bank_reg stays 0 the Z80 has not written port 0xF0 yet.
-//   Any non-zero value = CPU is alive and has set a ROM bank.
-//
-// Activity heartbeat (hc 64..191, vc 0..15):
-//   An 8-bit counter driven by dbg_cpu_active.
-//   Displayed as 16 px × 16 row blocks for each bit.
-//   The counter rolling over continuously = CPU is executing.
+// Each of the seven counters below is a free-running accumulator that
+// counts events during the current frame, then is copied into a
+// separate "display" register at the VBlank rising edge (so the
+// on-screen digits are stable for a whole frame instead of visibly
+// ticking mid-scan) and the accumulator is cleared for the next frame.
+// All accumulators saturate at 16'hFFFF rather than wrapping, so a
+// screen reading FFFF means "at least that many", never a silently
+// wrapped small number.
 //------------------------------------------------------------------
-reg [7:0] act_ctr;
-always @(posedge clk_sys)
-	if (dbg_cpu_active) act_ctr <= act_ctr + 1'd1;
+reg        ov_vblank_prev;
+wire       ov_vblank_rise = VBlank && !ov_vblank_prev;
 
-wire in_dbg_row  = (vc < 9'd16);                 // top 16 rows
-wire in_bank_col = (hc < 10'd80);                // leftmost 80 px (5 x 16px blocks)
-wire in_act_col  = (hc >= 10'd80) && (hc < 10'd208);  // next 128 px
+`define OV_ACC_TICK(acc, ev) acc <= (acc == 16'hFFFF) ? acc : (acc + ((ev) ? 16'd1 : 16'd0))
+// Restart-of-frame load: clears the accumulator while still counting an
+// event landing on the VBlank-rise cycle itself, so no tick is dropped at
+// the frame boundary. (2026-07-26: the VBlank branch previously re-used
+// OV_ACC_TICK here, so the accumulators were never cleared -- every
+// counter was a lifetime total and six of the seven pinned at the FFFF
+// saturation within seconds on hardware, hiding all per-frame structure.)
+`define OV_ACC_LOAD(acc, ev) acc <= ((ev) ? 16'd1 : 16'd0)
 
-// Second debug row (vc 16..31): live Master CPU PC, 16 bits × 16 px blocks
-// = 256 px wide (fits within 320 active). bit15 (MSB) at hc 0..15, down to
-// bit0 at hc 240..255. Lit = white, clear = dark grey.
-wire in_pc_row = (vc >= 9'd16) && (vc < 9'd32);
-wire in_pc_col = (hc < 10'd256);
-wire [3:0] pc_bit_idx = hc[7:4];              // 0..15
-wire pc_bit_val = dbg_pc[4'd15 - pc_bit_idx]; // MSB-first left to right
+reg [15:0] frame_cnt;
+reg [15:0] mstall_acc,  mstall_disp;   // #2 master ROM/SDRAM stall ticks
+reg [15:0] sstall_acc,  sstall_disp;   // #6 slave  ROM/SDRAM stall ticks
+reg [15:0] mracc_acc,   mracc_disp;    // master ROM cache accesses (MA)
+reg [15:0] mrmiss_acc,  mrmiss_disp;   // master ROM cache misses   (MR)
+reg [15:0] vwr_acc,     vwr_disp;      // #7 slave VRAM write ops
+reg [15:0] fcnt_acc,    fcnt_disp;     // tile-row fetches armed -- denominator for PM/TD
+reg [15:0] tdl_acc,     tdl_disp;      // #4 tile-fetch deadline misses
+reg [15:0] pmiss_acc,   pmiss_disp;    // #5 PROM cache misses
 
-// Third debug row (vc 32..47): live ROM byte fetched from SDRAM (Master),
-// 8 bits x 16 px blocks = 128 px wide. MSB-first left to right.
-wire in_rom_row = (vc >= 9'd32) && (vc < 9'd48);
-wire in_rom_col = (hc < 10'd128);
-wire [2:0] rom_bit_idx = hc[6:4];                 // 0..7
-wire rom_bit_val = dbg_rom_byte[3'd7 - rom_bit_idx];
+// Peak hold (2026-07-26): the per-frame values move far too fast to read off
+// a moving screen -- the only readings we have came from single-frame
+// screenshots. These latch the worst per-frame value seen and hold it, so a
+// slow section can be played through and the peak read afterwards at leisure.
+// Cleared whenever the overlay is toggled OFF, so flipping it off and back on
+// at the OSD re-arms the measurement for the next run.
+// pmiss_peak retired 2026-07-26: the PROM line cache settled it (PM tracks
+// FC/8 exactly on hardware), so the peak slot is better spent on the master
+// ROM cache miss count, which is the open question.
+reg [15:0] mstall_peak, sstall_peak, mrmiss_peak;
+reg        ov_show_prev;
 
-// Fourth debug row (vc 48..63): last I/O port address accessed by Master.
-// 8 bits x 16px blocks = 128 px wide, MSB-first. Cyan = read, magenta = write.
-wire in_io_row = (vc >= 9'd48) && (vc < 9'd64);
-wire in_io_col = (hc < 10'd128);
-wire [2:0] io_bit_idx = hc[6:4];
-wire io_bit_val = dbg_io_addr[3'd7 - io_bit_idx];
-wire [23:0] io_bit_color = dbg_io_rd ? 24'h00CCCC : 24'hCC00CC;
+always @(posedge clk_sys) begin
+	if (reset) begin
+		ov_vblank_prev <= 1'b0;
+		frame_cnt   <= 16'd0;
+		mstall_acc  <= 16'd0; mstall_disp <= 16'd0;
+		sstall_acc  <= 16'd0; sstall_disp <= 16'd0;
+		mracc_acc   <= 16'd0; mracc_disp  <= 16'd0;
+		mrmiss_acc  <= 16'd0; mrmiss_disp <= 16'd0;
+		vwr_acc     <= 16'd0; vwr_disp    <= 16'd0;
+		fcnt_acc    <= 16'd0; fcnt_disp   <= 16'd0;
+		tdl_acc     <= 16'd0; tdl_disp    <= 16'd0;
+		pmiss_acc   <= 16'd0; pmiss_disp  <= 16'd0;
+		mstall_peak <= 16'd0; sstall_peak <= 16'd0; mrmiss_peak <= 16'd0;
+		ov_show_prev <= 1'b0;
+	end else begin
+		ov_vblank_prev <= VBlank;
+		ov_show_prev   <= show_overlay;
+		if (!show_overlay && ov_show_prev) begin
+			mstall_peak <= 16'd0; sstall_peak <= 16'd0; mrmiss_peak <= 16'd0;
+		end else if (ov_vblank_rise) begin
+			if (mstall_acc > mstall_peak)  mstall_peak <= mstall_acc;
+			if (sstall_acc > sstall_peak)  sstall_peak <= sstall_acc;
+			if (mrmiss_acc > mrmiss_peak)  mrmiss_peak <= mrmiss_acc;
+		end
+		if (ov_vblank_rise) begin
+			frame_cnt   <= frame_cnt + 16'd1;
+			mstall_disp <= mstall_acc; `OV_ACC_LOAD(mstall_acc, master_stall_tick);
+			sstall_disp <= sstall_acc; `OV_ACC_LOAD(sstall_acc, slave_stall_tick);
+			mracc_disp  <= mracc_acc;  `OV_ACC_LOAD(mracc_acc,  mrom_access_tick);
+			mrmiss_disp <= mrmiss_acc; `OV_ACC_LOAD(mrmiss_acc, mrom_miss_tick);
+			vwr_disp    <= vwr_acc;    `OV_ACC_LOAD(vwr_acc,    slave_vram_write_tick);
+			fcnt_disp   <= fcnt_acc;   `OV_ACC_LOAD(fcnt_acc,   fetch_arm);
+			tdl_disp    <= tdl_acc;    `OV_ACC_LOAD(tdl_acc,    tile_deadline_miss);
+			pmiss_disp  <= pmiss_acc;  `OV_ACC_LOAD(pmiss_acc,  prom_cache_miss_ev);
+		end else begin
+			`OV_ACC_TICK(mstall_acc, master_stall_tick);
+			`OV_ACC_TICK(sstall_acc, slave_stall_tick);
+			`OV_ACC_TICK(mracc_acc,  mrom_access_tick);
+			`OV_ACC_TICK(mrmiss_acc, mrom_miss_tick);
+			`OV_ACC_TICK(vwr_acc,    slave_vram_write_tick);
+			`OV_ACC_TICK(fcnt_acc,   fetch_arm);
+			`OV_ACC_TICK(tdl_acc,    tile_deadline_miss);
+			`OV_ACC_TICK(pmiss_acc,  prom_cache_miss_ev);
+		end
+	end
+end
 
-// Fifth debug row (vc 64..79): SDRAM write/readback integrity check.
-//   hc   0..127: write-time checksum (8 bits, MSB-first, amber)
-//   hc 144..271: readback checksum   (8 bits, MSB-first, cyan)
-//   hc 288..303: match indicator — green once scan done and equal,
-//                red once scan done and different, dark grey mid-scan.
-wire in_chk_row  = (vc >= 9'd64) && (vc < 9'd80);
-wire in_wrchk_col = (hc < 10'd128);
-wire in_rdchk_col = (hc >= 10'd144) && (hc < 10'd272);
-wire in_match_col = (hc >= 10'd288) && (hc < 10'd304);
-wire [2:0] wrchk_bit_idx = hc[6:4];
-wire [2:0] rdchk_bit_idx = (hc - 10'd144) >> 4;
-wire wrchk_bit_val = dbg_wr_chk[3'd7 - wrchk_bit_idx];
-wire rdchk_bit_val = dbg_rd_chk[3'd7 - rdchk_bit_idx];
-wire [23:0] match_color = !dbg_chk_done ? 24'h333333 :
-                           dbg_chk_match ? 24'h22CC22 : 24'hCC2222;
+`undef OV_ACC_TICK
+`undef OV_ACC_LOAD
 
-// Sixth/seventh debug rows (vc 80..95 even, vc 96..111 odd): same
-// write/readback checksum layout as row five, split by byte parity.
-wire in_chk_even_row = (vc >= 9'd80)  && (vc < 9'd96);
-wire in_chk_odd_row  = (vc >= 9'd96)  && (vc < 9'd112);
-wire wrchk_even_bit_val = dbg_wr_chk_even[3'd7 - wrchk_bit_idx];
-wire rdchk_even_bit_val = dbg_rd_chk_even[3'd7 - rdchk_bit_idx];
-wire wrchk_odd_bit_val  = dbg_wr_chk_odd [3'd7 - wrchk_bit_idx];
-wire rdchk_odd_bit_val  = dbg_rd_chk_odd [3'd7 - rdchk_bit_idx];
-wire [23:0] match_even_color = !dbg_chk_done ? 24'h333333 :
-                                 dbg_chk_match_even ? 24'h22CC22 : 24'hCC2222;
-wire [23:0] match_odd_color  = !dbg_chk_done ? 24'h333333 :
-                                 dbg_chk_match_odd  ? 24'h22CC22 : 24'hCC2222;
-
-// Eighth debug row (vc 112..127): per-64KB-quarter match indicators,
-// one per Master ROM file (u58t/u59t/u57t/u56t, left to right).
-// 4 blocks, 32px wide each = 128px total. Dark grey mid-scan, green
-// on match, red on mismatch once the scan finishes.
-wire in_q_row = (vc >= 9'd112) && (vc < 9'd128);
-wire in_q_col = (hc < 10'd128);
-wire [1:0] q_idx = hc[6:5];   // 0..3, 32px per block
-wire [23:0] q_color = !dbg_chk_done_q  ? 24'h333333 :
-                       dbg_chk_match_q[q_idx] ? 24'h22CC22 : 24'hCC2222;
-
-// Ninth debug row (vc 128..143): isolated single-byte write/readback
-// self-test. hc 0..15: pass/fail indicator (dark grey until done,
-// green pass, red fail). hc 32..159: the actual readback byte value,
-// 8 bits x 16px, MSB-first, white=1/grey=0 — should read 0xA5
-// (10100101) on pass.
-wire in_bt_row      = (vc >= 9'd128) && (vc < 9'd144);
-wire in_bt_ind_col   = (hc < 10'd16);
-wire in_bt_data_col  = (hc >= 10'd32) && (hc < 10'd160);
-wire [2:0] bt_bit_idx = (hc - 10'd32) >> 4;
-wire bt_bit_val = dbg_bt_readback[3'd7 - bt_bit_idx];
-wire [23:0] bt_ind_color = !dbg_bt_done ? 24'h333333 :
-                            dbg_bt_pass ? 24'h22CC22 : 24'hCC2222;
-
-//------------------------------------------------------------------
-// Tenth debug row (vc 144..151): text readout of the checksum/self-test
-// results, so they can be transcribed as plain characters instead of
-// having to read color/bit-pattern blocks off a photo (which repeatedly
-// proved unreliable in practice). 20 characters x 8px = 160px wide.
-//
-// Layout: "WW RR - M E O - Q Q Q Q - B"
-//   WW = wr_chk hex byte, RR = rd_chk hex byte (combined checksum)
-//   M  = combined match (P=pass, F=fail, -=scan not done yet)
-//   E  = even-byte-only match, O = odd-byte-only match
-//   Q  = per-64KB-quarter match, one char each (u58t/u59t/u57t/u56t order)
-//   B  = isolated single-byte self-test (P/F/-)
-//------------------------------------------------------------------
-// Font: 5x7 glyph per character. char codes 0-9 = digits, 10-15 = hex
-// A-F (also doubles as literal letter F for "Fail" -- same glyph shape
-// serves both), 16 = 'P', 17 = space, 18 = '-'.
+// 5x7 font, one glyph per 5-bit character code -- minimal subset
+// recovered/extended from the pre-b01c24b overlay (commit b01c24b^:
+// rtl/sor_video.sv), NOT the byte-test/self-test machinery around it
+// (deliberately not restored, per the investigation handoff). Codes
+// 10-15 double as both hex A-F and the literal letters used below
+// (D/E/F), same idiom the original font used.
 function automatic [34:0] font_glyph;
 	input [4:0] ch;
 	begin
@@ -826,661 +1123,163 @@ function automatic [34:0] font_glyph;
 			5'd15: font_glyph = {5'b11111,5'b10000,5'b10000,5'b11110,5'b10000,5'b10000,5'b10000}; // F
 			5'd16: font_glyph = {5'b11110,5'b10001,5'b10001,5'b11110,5'b10000,5'b10000,5'b10000}; // P
 			5'd18: font_glyph = {5'b00000,5'b00000,5'b00000,5'b11111,5'b00000,5'b00000,5'b00000}; // -
+			5'd19: font_glyph = {5'b11110,5'b10001,5'b10001,5'b11110,5'b10100,5'b10010,5'b10001}; // R
+			5'd20: font_glyph = {5'b01111,5'b10000,5'b10000,5'b01110,5'b00001,5'b00001,5'b11110}; // S
+			5'd21: font_glyph = {5'b11111,5'b00100,5'b00100,5'b00100,5'b00100,5'b00100,5'b00100}; // T
+			5'd22: font_glyph = {5'b01110,5'b10001,5'b10000,5'b10111,5'b10001,5'b10001,5'b01111}; // G
+			5'd23: font_glyph = {5'b10001,5'b11011,5'b10101,5'b10101,5'b10001,5'b10001,5'b10001}; // M
+			5'd24: font_glyph = {5'b10001,5'b10001,5'b10001,5'b10001,5'b10001,5'b01010,5'b00100}; // V
+			5'd25: font_glyph = {5'b10001,5'b10001,5'b10001,5'b10101,5'b10101,5'b10101,5'b01010}; // W
+			5'd26: font_glyph = {5'b00000,5'b00100,5'b00000,5'b00000,5'b00000,5'b00100,5'b00000}; // :
 			default: font_glyph = 35'd0; // 17 = space, and unused codes
 		endcase
 	end
 endfunction
 
-wire in_text_row = (vc >= 9'd144) && (vc < 9'd152);
-wire [4:0] text_char_idx = hc[7:3];   // 0..19, 8px per character cell
-wire [2:0] text_col      = hc[2:0];   // 0..7 within each cell
-wire [2:0] text_row_y    = vc - 9'd144; // 0..7
+// Three 8px-tall text rows across the top of active video (vc 0..23),
+// 8px-wide character cells, priority order per the investigation
+// handoff (most to least valuable): VRAM writes, master stall, slave
+// stall, frame counter, PROM misses, tile deadline misses, rd2 grants,
+// plus the optional slave port-stall as an 8th if room allows (it did).
+//   Row0 (vc  0- 7): "VW:xxxx MS:xxxx SS:xxxx"  per-frame
+//   Row1 (vc  8-15): "FR:xxxx PM:xxxx TD:xxxx"  per-frame (FR free-runs)
+//   Row2 (vc 16-23): "FC:xxxx MR:xxxx MA:xxxx"  per-frame (FC = PM/TD denom,
+//                    MR/MA = master ROM line-cache miss/access)
+//   Row3 (vc 24-31): "PM:xxxx PS:xxxx PR:xxxx"  peak hold since overlay on
+//                    (peak master stall / slave stall / master ROM misses)
+localparam [8:0] OV_ROWS = 9'd32;
+wire        in_overlay_area = show_overlay && (vc < OV_ROWS) && (hc < H_ACTIVE);
+wire [1:0]  ov_row_sel = vc[4:3];     // 0/1/2/3 selects which text row
+wire [5:0]  ov_char_idx = hc[8:3];    // 0..39, 8px per char cell
+wire [2:0]  ov_row_y    = vc[2:0];
+wire [2:0]  ov_col      = hc[2:0];
 
-reg [4:0] text_ch;
+reg [4:0] ov_ch;
 always @(*) begin
-	case (text_char_idx)
-		5'd0 : text_ch = dbg_wr_chk[7:4];
-		5'd1 : text_ch = dbg_wr_chk[3:0];
-		5'd2 : text_ch = 5'd17; // space
-		5'd3 : text_ch = dbg_rd_chk[7:4];
-		5'd4 : text_ch = dbg_rd_chk[3:0];
-		5'd5 : text_ch = 5'd17;
-		5'd6 : text_ch = 5'd18; // -
-		5'd7 : text_ch = 5'd17;
-		5'd8 : text_ch = !dbg_chk_done      ? 5'd18 : (dbg_chk_match      ? 5'd16 : 5'd15);
-		5'd9 : text_ch = !dbg_chk_done      ? 5'd18 : (dbg_chk_match_even ? 5'd16 : 5'd15);
-		5'd10: text_ch = !dbg_chk_done      ? 5'd18 : (dbg_chk_match_odd  ? 5'd16 : 5'd15);
-		5'd11: text_ch = 5'd17;
-		5'd12: text_ch = 5'd18;
-		5'd13: text_ch = 5'd17;
-		5'd14: text_ch = !dbg_chk_done_q ? 5'd18 : (dbg_chk_match_q[0] ? 5'd16 : 5'd15);
-		5'd15: text_ch = !dbg_chk_done_q ? 5'd18 : (dbg_chk_match_q[1] ? 5'd16 : 5'd15);
-		5'd16: text_ch = !dbg_chk_done_q ? 5'd18 : (dbg_chk_match_q[2] ? 5'd16 : 5'd15);
-		5'd17: text_ch = !dbg_chk_done_q ? 5'd18 : (dbg_chk_match_q[3] ? 5'd16 : 5'd15);
-		5'd18: text_ch = 5'd17;
-		5'd19: text_ch = !dbg_bt_done ? 5'd18 : (dbg_bt_pass ? 5'd16 : 5'd15);
-		default: text_ch = 5'd17;
+	case (ov_row_sel)
+		2'd0: case (ov_char_idx) // "VW:xxxx MS:xxxx SS:xxxx"
+			6'd0 : ov_ch = 5'd24; // V
+			6'd1 : ov_ch = 5'd25; // W
+			6'd2 : ov_ch = 5'd26; // :
+			6'd3 : ov_ch = vwr_disp[15:12];
+			6'd4 : ov_ch = vwr_disp[11:8];
+			6'd5 : ov_ch = vwr_disp[7:4];
+			6'd6 : ov_ch = vwr_disp[3:0];
+			6'd7 : ov_ch = 5'd17; // space
+			6'd8 : ov_ch = 5'd23; // M
+			6'd9 : ov_ch = 5'd20; // S
+			6'd10: ov_ch = 5'd26; // :
+			6'd11: ov_ch = mstall_disp[15:12];
+			6'd12: ov_ch = mstall_disp[11:8];
+			6'd13: ov_ch = mstall_disp[7:4];
+			6'd14: ov_ch = mstall_disp[3:0];
+			6'd15: ov_ch = 5'd17;
+			6'd16: ov_ch = 5'd20; // S
+			6'd17: ov_ch = 5'd20; // S
+			6'd18: ov_ch = 5'd26; // :
+			6'd19: ov_ch = sstall_disp[15:12];
+			6'd20: ov_ch = sstall_disp[11:8];
+			6'd21: ov_ch = sstall_disp[7:4];
+			6'd22: ov_ch = sstall_disp[3:0];
+			default: ov_ch = 5'd17;
+		endcase
+		2'd1: case (ov_char_idx) // "FR:xxxx PM:xxxx TD:xxxx"
+			6'd0 : ov_ch = 5'd15; // F
+			6'd1 : ov_ch = 5'd19; // R
+			6'd2 : ov_ch = 5'd26; // :
+			6'd3 : ov_ch = frame_cnt[15:12];
+			6'd4 : ov_ch = frame_cnt[11:8];
+			6'd5 : ov_ch = frame_cnt[7:4];
+			6'd6 : ov_ch = frame_cnt[3:0];
+			6'd7 : ov_ch = 5'd17;
+			6'd8 : ov_ch = 5'd16; // P
+			6'd9 : ov_ch = 5'd23; // M
+			6'd10: ov_ch = 5'd26; // :
+			6'd11: ov_ch = pmiss_disp[15:12];
+			6'd12: ov_ch = pmiss_disp[11:8];
+			6'd13: ov_ch = pmiss_disp[7:4];
+			6'd14: ov_ch = pmiss_disp[3:0];
+			6'd15: ov_ch = 5'd17;
+			6'd16: ov_ch = 5'd21; // T
+			6'd17: ov_ch = 5'd13; // D
+			6'd18: ov_ch = 5'd26; // :
+			6'd19: ov_ch = tdl_disp[15:12];
+			6'd20: ov_ch = tdl_disp[11:8];
+			6'd21: ov_ch = tdl_disp[7:4];
+			6'd22: ov_ch = tdl_disp[3:0];
+			default: ov_ch = 5'd17;
+		endcase
+		2'd2: case (ov_char_idx) // "FC:xxxx MR:xxxx MA:xxxx"
+			6'd0 : ov_ch = 5'd15; // F
+			6'd1 : ov_ch = 5'd12; // C
+			6'd2 : ov_ch = 5'd26; // :
+			6'd3 : ov_ch = fcnt_disp[15:12];
+			6'd4 : ov_ch = fcnt_disp[11:8];
+			6'd5 : ov_ch = fcnt_disp[7:4];
+			6'd6 : ov_ch = fcnt_disp[3:0];
+			6'd7 : ov_ch = 5'd17;
+			6'd8 : ov_ch = 5'd23; // M
+			6'd9 : ov_ch = 5'd19; // R
+			6'd10: ov_ch = 5'd26; // :
+			6'd11: ov_ch = mrmiss_disp[15:12];
+			6'd12: ov_ch = mrmiss_disp[11:8];
+			6'd13: ov_ch = mrmiss_disp[7:4];
+			6'd14: ov_ch = mrmiss_disp[3:0];
+			6'd15: ov_ch = 5'd17;
+			6'd16: ov_ch = 5'd23; // M
+			6'd17: ov_ch = 5'd10; // A
+			6'd18: ov_ch = 5'd26; // :
+			6'd19: ov_ch = mracc_disp[15:12];
+			6'd20: ov_ch = mracc_disp[11:8];
+			6'd21: ov_ch = mracc_disp[7:4];
+			6'd22: ov_ch = mracc_disp[3:0];
+			default: ov_ch = 5'd17;
+		endcase
+		// Peak-hold row: worst per-frame value since the overlay was last
+		// switched on. "P" prefix = peak.
+		2'd3: case (ov_char_idx) // "PM:xxxx PS:xxxx PR:xxxx"
+			6'd0 : ov_ch = 5'd16; // P
+			6'd1 : ov_ch = 5'd23; // M
+			6'd2 : ov_ch = 5'd26; // :
+			6'd3 : ov_ch = mstall_peak[15:12];
+			6'd4 : ov_ch = mstall_peak[11:8];
+			6'd5 : ov_ch = mstall_peak[7:4];
+			6'd6 : ov_ch = mstall_peak[3:0];
+			6'd7 : ov_ch = 5'd17;
+			6'd8 : ov_ch = 5'd16; // P
+			6'd9 : ov_ch = 5'd20; // S
+			6'd10: ov_ch = 5'd26; // :
+			6'd11: ov_ch = sstall_peak[15:12];
+			6'd12: ov_ch = sstall_peak[11:8];
+			6'd13: ov_ch = sstall_peak[7:4];
+			6'd14: ov_ch = sstall_peak[3:0];
+			6'd15: ov_ch = 5'd17;
+			6'd16: ov_ch = 5'd16; // P
+			6'd17: ov_ch = 5'd19; // R
+			6'd18: ov_ch = 5'd26; // :
+			6'd19: ov_ch = mrmiss_peak[15:12];
+			6'd20: ov_ch = mrmiss_peak[11:8];
+			6'd21: ov_ch = mrmiss_peak[7:4];
+			6'd22: ov_ch = mrmiss_peak[3:0];
+			default: ov_ch = 5'd17;
+		endcase
+		default: ov_ch = 5'd17;
 	endcase
 end
 
-wire [34:0] text_glyph = font_glyph(text_ch);
-wire  [5:0] text_bit_pos = {3'd0, text_row_y} * 6'd5 + {3'd0, text_col};
-wire        text_pixel = (text_col < 3'd5) && (text_row_y < 3'd7) &&
-                          text_glyph[34 - text_bit_pos];
-
-//------------------------------------------------------------------
-// Eleventh debug row (vc 152..159): ground-truth first 4 bytes read
-// back from SDRAM at Master ROM addresses 0-3, as plain hex text.
-// Compare directly against a known ROM hex dump (e.g. expect the fixed
-// bank's actual first bytes "F3 ED 56 31") to settle whether the SDRAM
-// round-trip itself is correct, independent of the checksum's opaque
-// pass/fail.
-//------------------------------------------------------------------
-wire in_scan_row = (vc >= 9'd152) && (vc < 9'd160);
-wire [3:0] scan_char_idx = hc[6:3]; // 0..11, 8px per character cell
-wire [2:0] scan_row_y    = vc - 9'd152;
-
-reg [4:0] scan_ch;
-always @(*) begin
-	case (scan_char_idx)
-		4'd0 : scan_ch = dbg_scan_b0[7:4];
-		4'd1 : scan_ch = dbg_scan_b0[3:0];
-		4'd2 : scan_ch = 5'd17;
-		4'd3 : scan_ch = dbg_scan_b1[7:4];
-		4'd4 : scan_ch = dbg_scan_b1[3:0];
-		4'd5 : scan_ch = 5'd17;
-		4'd6 : scan_ch = dbg_scan_b2[7:4];
-		4'd7 : scan_ch = dbg_scan_b2[3:0];
-		4'd8 : scan_ch = 5'd17;
-		4'd9 : scan_ch = dbg_scan_b3[7:4];
-		4'd10: scan_ch = dbg_scan_b3[3:0];
-		default: scan_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] scan_glyph = font_glyph(scan_ch);
-wire  [5:0] scan_bit_pos = {3'd0, scan_row_y} * 6'd5 + {3'd0, text_col};
-wire        scan_pixel = (text_col < 3'd5) && (scan_row_y < 3'd7) &&
-                          scan_glyph[34 - scan_bit_pos];
-
-//------------------------------------------------------------------
-// Twelfth debug row (vc 160..167): mirror of the scan-byte row, but
-// on the WRITE side -- the actual bytes handed to the SDRAM write
-// port at addresses 0-3. Compared against the row above (read-back),
-// this separates "wrong data went in" from "right data went in, wrong
-// data came back out".
-//------------------------------------------------------------------
-wire in_wrb_row = (vc >= 9'd160) && (vc < 9'd168);
-wire [3:0] wrb_char_idx = hc[6:3];
-wire [2:0] wrb_row_y    = vc - 9'd160;
-
-reg [4:0] wrb_ch;
-always @(*) begin
-	case (wrb_char_idx)
-		4'd0 : wrb_ch = dbg_wr_b0[7:4];
-		4'd1 : wrb_ch = dbg_wr_b0[3:0];
-		4'd2 : wrb_ch = 5'd17;
-		4'd3 : wrb_ch = dbg_wr_b1[7:4];
-		4'd4 : wrb_ch = dbg_wr_b1[3:0];
-		4'd5 : wrb_ch = 5'd17;
-		4'd6 : wrb_ch = dbg_wr_b2[7:4];
-		4'd7 : wrb_ch = dbg_wr_b2[3:0];
-		4'd8 : wrb_ch = 5'd17;
-		4'd9 : wrb_ch = dbg_wr_b3[7:4];
-		4'd10: wrb_ch = dbg_wr_b3[3:0];
-		default: wrb_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] wrb_glyph = font_glyph(wrb_ch);
-wire  [5:0] wrb_bit_pos = {3'd0, wrb_row_y} * 6'd5 + {3'd0, text_col};
-wire        wrb_pixel = (text_col < 3'd5) && (wrb_row_y < 3'd7) &&
-                         wrb_glyph[34 - wrb_bit_pos];
-
-//------------------------------------------------------------------
-// Thirteenth debug row (vc 168..175): address 0 read back from SDRAM
-// right as the Master ROM finishes loading -- a single 2-digit hex
-// value. Compare against slot 0 of the read-back row above
-// (dbg_scan_b0, the same address read only at the very end): if this
-// early value is correct (0xF3) but the later one isn't, that's direct
-// proof of decay over the load's duration rather than a logic bug.
-//------------------------------------------------------------------
-wire in_early_row = (vc >= 9'd168) && (vc < 9'd176);
-wire [3:0] early_char_idx = hc[6:3];
-wire [2:0] early_row_y    = vc - 9'd168;
-
-reg [4:0] early_ch;
-always @(*) begin
-	case (early_char_idx)
-		4'd0: early_ch = dbg_early_b0[7:4];
-		4'd1: early_ch = dbg_early_b0[3:0];
-		default: early_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] early_glyph = font_glyph(early_ch);
-wire  [5:0] early_bit_pos = {3'd0, early_row_y} * 6'd5 + {3'd0, text_col};
-wire        early_pixel = (text_col < 3'd5) && (early_row_y < 3'd7) &&
-                           early_glyph[34 - early_bit_pos];
-
-//------------------------------------------------------------------
-// Fourteenth debug row (vc 176..183): address 0 read back IMMEDIATELY
-// after its own write acknowledges -- essentially zero elapsed time.
-// The most decisive of the three address-0 readback checks: if this
-// is ALSO wrong, decay over time is ruled out entirely and the fault
-// is in the actual SDRAM write or in reading it back moments later.
-//------------------------------------------------------------------
-wire in_imm_row = (vc >= 9'd176) && (vc < 9'd184);
-wire [3:0] imm_char_idx = hc[6:3];
-wire [2:0] imm_row_y    = vc - 9'd176;
-
-reg [4:0] imm_ch;
-always @(*) begin
-	case (imm_char_idx)
-		4'd0: imm_ch = dbg_immediate_b0[7:4];
-		4'd1: imm_ch = dbg_immediate_b0[3:0];
-		default: imm_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] imm_glyph = font_glyph(imm_ch);
-wire  [5:0] imm_bit_pos = {3'd0, imm_row_y} * 6'd5 + {3'd0, text_col};
-wire        imm_pixel = (text_col < 3'd5) && (imm_row_y < 3'd7) &&
-                         imm_glyph[34 - imm_bit_pos];
-
-//------------------------------------------------------------------
-// Fifteenth debug row (vc 184..191): running count of real rd2-channel
-// completions (saturating hex byte). Tells us whether dbg_scan_b0 --
-// which came back matching the byte-test's own BT_PATTERN instead of
-// the real ROM byte -- reflects a genuinely fresh SDRAM transaction.
-//------------------------------------------------------------------
-wire in_rd2cnt_row = (vc >= 9'd184) && (vc < 9'd192);
-wire [3:0] rd2cnt_char_idx = hc[6:3];
-wire [2:0] rd2cnt_row_y    = vc - 9'd184;
-
-reg [4:0] rd2cnt_ch;
-always @(*) begin
-	case (rd2cnt_char_idx)
-		4'd0: rd2cnt_ch = dbg_rd2_ack_cnt[7:4];
-		4'd1: rd2cnt_ch = dbg_rd2_ack_cnt[3:0];
-		default: rd2cnt_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] rd2cnt_glyph = font_glyph(rd2cnt_ch);
-wire  [5:0] rd2cnt_bit_pos = {3'd0, rd2cnt_row_y} * 6'd5 + {3'd0, text_col};
-wire        rd2cnt_pixel = (text_col < 3'd5) && (rd2cnt_row_y < 3'd7) &&
-                            rd2cnt_glyph[34 - rd2cnt_bit_pos];
-
-//------------------------------------------------------------------
-// Sixteenth debug row (vc 192..199): re-test of the ioctl_addr skew
-// theory at address 2 -- "RR DD", RR = raw (undelayed) ioctl_addr low
-// byte at the moment ioctl_addr_d1 first read 2, DD = the byte value
-// seen. RR==02 means no skew (matches the delayed value); RR==03 means
-// a real one-cycle skew exists here and ioctl_addr_d1 is load-bearing.
-//------------------------------------------------------------------
-wire in_a2_row = (vc >= 9'd192) && (vc < 9'd200);
-wire [3:0] a2_char_idx = hc[7:3];
-wire [2:0] a2_row_y    = vc - 9'd192;
-
-reg [4:0] a2_ch;
-always @(*) begin
-	case (a2_char_idx)
-		4'd0 : a2_ch = dbg_accept2_raw_addr[7:4];
-		4'd1 : a2_ch = dbg_accept2_raw_addr[3:0];
-		4'd2 : a2_ch = 5'd17;
-		4'd3 : a2_ch = dbg_accept2_data[7:4];
-		4'd4 : a2_ch = dbg_accept2_data[3:0];
-		default: a2_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] a2_glyph = font_glyph(a2_ch);
-wire  [5:0] a2_bit_pos = {3'd0, a2_row_y} * 6'd5 + {3'd0, text_col};
-wire        a2_pixel = (text_col < 3'd5) && (a2_row_y < 3'd7) &&
-                        a2_glyph[34 - a2_bit_pos];
-
-//------------------------------------------------------------------
-// Seventeenth debug row (vc 200..207): number of download sessions
-// the ARM actually delivered (expected 01 -- see dbg_dl_sessions
-// port comment for why this isn't 05 anymore).
-//------------------------------------------------------------------
-wire in_dls_row = (vc >= 9'd200) && (vc < 9'd208);
-wire [3:0] dls_char_idx = hc[6:3];
-wire [2:0] dls_row_y    = vc - 9'd200;
-
-reg [4:0] dls_ch;
-always @(*) begin
-	case (dls_char_idx)
-		4'd0: dls_ch = dbg_dl_sessions[7:4];
-		4'd1: dls_ch = dbg_dl_sessions[3:0];
-		default: dls_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] dls_glyph = font_glyph(dls_ch);
-wire  [5:0] dls_bit_pos = {3'd0, dls_row_y} * 6'd5 + {3'd0, text_col};
-wire        dls_pixel = (text_col < 3'd5) && (dls_row_y < 3'd7) &&
-                         dls_glyph[34 - dls_bit_pos];
-
-//------------------------------------------------------------------
-// Eighteenth debug row (vc 208..215): paired byte-test readback,
-// "EE OO" -- EE = even-address byte (expect A5), OO = odd-address
-// byte (expect 5A). EE==OO (e.g. "5A 5A") fingerprints a stuck
-// DQM/byte-lane; see sor_board.sv's BT_PATTERN2 comment for the full
-// fault table.
-//------------------------------------------------------------------
-wire in_btp_row = (vc >= 9'd208) && (vc < 9'd216);
-wire [3:0] btp_char_idx = hc[7:3];
-wire [2:0] btp_row_y    = vc - 9'd208;
-
-reg [4:0] btp_ch;
-always @(*) begin
-	case (btp_char_idx)
-		4'd0 : btp_ch = dbg_bt_readback[7:4];
-		4'd1 : btp_ch = dbg_bt_readback[3:0];
-		4'd2 : btp_ch = 5'd17;
-		4'd3 : btp_ch = dbg_bt_readback2[7:4];
-		4'd4 : btp_ch = dbg_bt_readback2[3:0];
-		default: btp_ch = 5'd17;
-	endcase
-end
-
-wire [34:0] btp_glyph = font_glyph(btp_ch);
-wire  [5:0] btp_bit_pos = {3'd0, btp_row_y} * 6'd5 + {3'd0, text_col};
-wire        btp_pixel = (text_col < 3'd5) && (btp_row_y < 3'd7) &&
-                         btp_glyph[34 - btp_bit_pos];
-
-// Which bit of bank_reg (each block = 16 px, 5 blocks = 80 px)
-wire [2:0] bank_bit_idx = hc[6:4];   // 0..4 within 0..79
-wire bank_bit_val = dbg_bank[bank_bit_idx];
-
-wire [23:0] bank_bit_color =
-	(bank_bit_idx == 3'd0) ? 24'hCC2222 :   // bit 0 = red
-	(bank_bit_idx == 3'd1) ? 24'h22CC22 :   // bit 1 = green
-	(bank_bit_idx == 3'd2) ? 24'h2222CC :   // bit 2 = blue
-	(bank_bit_idx == 3'd3) ? 24'hCCCCCC :   // bit 3 = white
-	                         24'hFF8800;    // bit 4 = orange
-
-// Which bit of act_ctr (each block = 16 px within the 128 px zone)
-wire [2:0] act_bit_idx = (hc - 10'd80) >> 4;   // 0..7 within 80..207
-wire act_bit_val = act_ctr[act_bit_idx];
-
-wire [23:0] dbg_pixel =
-	in_bank_col ? (bank_bit_val ? bank_bit_color : 24'h333333) :
-	in_act_col  ? (act_bit_val  ? 24'hFFAA00    : 24'h222222) :
-	              24'h111111;   // right side of debug row: near-black border
+wire [34:0] ov_glyph  = font_glyph(ov_ch);
+wire  [5:0] ov_bitpos = {3'd0, ov_row_y} * 6'd5 + {3'd0, ov_col};
+wire        ov_pixel  = (ov_col < 3'd5) && (ov_row_y < 3'd7) && ov_glyph[34 - ov_bitpos];
 
 //------------------------------------------------------------------
 // Output register
-//
-// HARDWARE TIMING-CLOSURE EXPERIMENT (temporary): SHOW_DEBUG_OVERLAY=0
-// bypasses the entire debug-row compositing chain below, so none of
-// the upstream font-glyph/row logic feeding it has any path to an
-// output pin -- synthesis should prune all of it as dead logic. This
-// tests whether the overlay's LUT/routing footprint was contributing
-// to a timing-closure problem invisible to a zero-delay behavioral
-// simulator (every RTL fix this session has verified correctly in sim
-// and changed nothing on real hardware, the classic signature of a
-// timing problem sim can't show). Set back to 1 to restore the
-// overlay once this experiment is answered -- no other logic in this
-// file needs to change either way.
 //------------------------------------------------------------------
-// Diagnostic job is done -- see ENABLE_SDRAM_DIAG_TRAFFIC in
-// sor_board.sv for the full rationale. Flip back to 1 to restore the
-// overlay if diagnostics are needed again.
-localparam bit SHOW_DEBUG_OVERLAY = 1'b0;
-
-// 2026-07-18: WP10 sound bring-up is done (interrupt sticky-request fix,
-// tick4 pulse-width fix, ext_int_inhibit priority fix, response_data
-// handshake wiring -- see docs/WP10_PROGRESS.md "round 6") and hardware
-// testing confirmed sound works through song transitions. The three
-// always-on status rows (PC/heartbeat/sound taps, runaway-PC trap,
-// sound-CPU liveness) below are display-only diagnostics -- gating them
-// here (rather than deleting the rows, their glyph-rendering logic, or
-// any of the dbg_* ports/taps feeding them) restores the full game
-// picture for real play while keeping every trace point intact for the
-// next time hardware-level debugging is needed. Flip back to 1 to
-// re-enable; actual RTL cleanup of this debug infrastructure is
-// deferred to a later pass, not done here.
-localparam bit SHOW_STATUS_ROWS = 1'b0;
-
-//------------------------------------------------------------------
-// VSync heartbeat and the sticky I/O-read squares (GIN0/GIN1/MCONT/
-// CRAM/SCROLL/VRAM/ISR) have served their diagnostic purpose --
-// removed 2026-07-12 once real gameplay was reached and the squares'
-// blended-together appearance started reading as a spurious colored
-// HUD bar in screenshots, confusing "is this the game's real HUD or
-// our overlay" triage. The status text row below (PC/bank/heartbeat/
-// IRQ count/last I/O port) is kept -- still useful for troubleshooting
-// and reads unambiguously as debug text, not game content.
-//------------------------------------------------------------------
-reg        vsync_prev;
-always @(posedge clk_sys) vsync_prev <= VSync;
-
-// Rolling 8-bit saturating counters for the two audio-activity pulses
-// (same idiom as dbg_s_bank_wr_cnt above) -- lets a screenshot show
-// "how much" DAC activity has happened since boot, not just a
-// snapshot level. Saturates rather than wraps so a screenshot doesn't
-// misread a wrapped-back-to-0 count as "no activity".
-//
-// Deliberately NOT gated on this module's own `reset` input (real
-// hardware found the bug: this port is `reset | ~video_release`, a
-// VIDEO-pipeline-specific release signal, separate from the sound
-// board's own `reset | ~cpu_release` in sor_board.sv -- if the 80186's
-// boot self-test (and its DAC pulses, dbg_dac_activity/dbg_dac9_activity)
-// completes before video_release ever goes high, this counter's own
-// `if (reset)` branch was silently re-clearing it through the entire
-// window those pulses arrived in, even though the pulses themselves
-// were correctly wired -- a real boot pop was audible on every core
-// reset the whole time, proving the sound board itself was fine.
-// Matches this file's own `heartbeat` register's convention just above
-// (free-running from FPGA power-up default 0, no explicit reset at
-// all) rather than inventing a new, still-possibly-wrong reset source.
-reg [7:0] dac_activity_cnt, dac9_activity_cnt;
-always @(posedge clk_sys) begin
-	if (dbg_dac_activity  && (dac_activity_cnt  != 8'hFF)) dac_activity_cnt  <= dac_activity_cnt  + 8'd1;
-	if (dbg_dac9_activity && (dac9_activity_cnt != 8'hFF)) dac9_activity_cnt <= dac9_activity_cnt + 8'd1;
-end
-
-// Same free-running-counter idiom, for the sound-CPU liveness taps
-// (see the port comments above).
-reg [7:0] core_bus_activity_cnt, rom_fetch_activity_cnt;
-always @(posedge clk_sys) begin
-	if (dbg_snd_core_bus_activity && (core_bus_activity_cnt != 8'hFF)) core_bus_activity_cnt <= core_bus_activity_cnt + 8'd1;
-	if (dbg_snd_rom_fetch_activity && (rom_fetch_activity_cnt != 8'hFF)) rom_fetch_activity_cnt <= rom_fetch_activity_cnt + 8'd1;
-end
-
-//------------------------------------------------------------------
-// Minimal always-on status strip: "PC=XXXX BK=X HB=X", a single 8px
-// text row at the very top (vc 0..7), independent of
-// SHOW_DEBUG_OVERLAY. Not the full overlay -- just enough to tell
-// whether the Master CPU is actually executing (PC changing over
-// time, matched against a heartbeat that increments once per VSync
-// so two screenshots a few seconds apart show a moving digit) versus
-// genuinely stuck, since MAME's own boot has no memory-check screen
-// to compare against and a single static screenshot can't otherwise
-// distinguish "frozen" from "running but the picture just looks
-// static/rolling for a video-timing reason".
-//------------------------------------------------------------------
-reg [3:0] heartbeat;
-always @(posedge clk_sys) if (VSync && !vsync_prev) heartbeat <= heartbeat + 4'd1;
-
-wire in_status_row = (vc < 9'd8);
-// 6 bits, not 5: active area is hc 0..319 = 40 8px cells, needing bits
-// [8:3]. The earlier [7:3] (5 bits) silently dropped hc[8], wrapping
-// the pattern back to index 0 at hc=256 and rendering it a second
-// time within the same active row -- the "PC 2BDx" repeat visible on
-// hardware screenshots was this bug, not a scaler artifact.
-wire [5:0] status_char_idx = hc[8:3];
-wire [2:0] status_row_y    = vc[2:0];
-
-reg [4:0] status_ch;
-always @(*) begin
-	case (status_char_idx)
-		// 2026-07-12 session: stripped back to a minimal, high-signal
-		// set after a run of diagnostic-only builds correlated with the
-		// foreground text layer's on-screen position shifting/breaking
-		// build to build (this design isn't timing-clean -- every
-		// Quartus run reports "not fully constrained for setup/hold
-		// requirements" -- so overlay logic footprint appears to matter
-		// for text stability even though it can't touch gfx_rom/prom_rom
-		// BRAM inference, which is proven identical between builds).
-		// Kept: PC + heartbeat (basic liveness) and the new gfx_rom
-		// self-test result (see sor_board.sv's GFX_SELFTEST_ADDR
-		// comment) -- a synthetic, ioctl-timing-independent write+
-		// readback proving whether gfx_rom's BRAM interface itself
-		// works at all, the one thing never directly tested before.
-		6'd0 : status_ch = 5'd16; // 'P' (reuses the P glyph shape)
-		6'd1 : status_ch = 12;    // 'C' glyph index (see font_glyph: 12=C)
-		6'd2 : status_ch = 5'd17; // space
-		6'd3 : status_ch = dbg_pc[15:12];
-		6'd4 : status_ch = dbg_pc[11:8];
-		6'd5 : status_ch = dbg_pc[7:4];
-		6'd6 : status_ch = dbg_pc[3:0];
-		6'd7 : status_ch = 5'd17;
-		6'd8 : status_ch = heartbeat;
-		6'd9 : status_ch = 5'd17;
-		// 2026-07-18: chars 10-29 repurposed from the (stale,
-		// already-confirmed-passing -- see docs/SESSION_2026-07-14.md
-		// Follow-up 6 for the retired Slave-ROM-bringup layout this
-		// replaces) Slave-side debug fields to sound-board audio
-		// diagnostics, for the "clean boot pop but no sound during real
-		// gameplay" investigation (docs/WP10_PROGRESS.md). dbg_s_pc/
-		// dbg_s_bank_reg/etc. ports and their OTHER consumer
-		// (sor_board.sv's stall_vram_ref watchdog) are untouched --
-		// only what this row displays changed. Layout:
-		//   10-11: dac_activity_cnt  -- saturating count of any of the 6
-		//          8-bit DAC channel writes since boot/reset (2 hex)
-		//   13-14: dac9_activity_cnt -- same, for the dac9 (10-bit,
-		//          timer-paced) channel specifically (2 hex). WP0's own
-		//          real-hardware capture put dac9 at ~7.5kHz once
-		//          actually streaming -- if this count is stuck at 1
-		//          (the boot self-test's own single write) while
-		//          dac_activity_cnt is also stuck, nothing past boot is
-		//          ever driving the DAC at all.
-		//   16:    dbg_snd_int0_pin -- live level into i186_periph's
-		//          external interrupt 0 (0/1)
-		//   18-19: dbg_snd_intc_request -- i186_periph's
-		//          intc_request_reg (2 hex; bit4=ext0 pending)
-		//   21-22: dbg_snd_intc_in_service -- i186_periph's
-		//          intc_in_service_reg (2 hex; bit4=ext0 in service --
-		//          per i186_periph.sv's own do_ack = inta || poll_read_ack,
-		//          this sets the same way whether the 80186 took a real
-		//          vectored interrupt OR serviced it via POLL-register
-		//          read, so a nonzero-then-clearing bit4 here means
-		//          SOMETHING serviced the request, regardless of which
-		//          mechanism)
-		// 12/15/17/20/23-29 are spaces/blank.
-		6'd10: status_ch = dac_activity_cnt[7:4];
-		6'd11: status_ch = dac_activity_cnt[3:0];
-		6'd12: status_ch = 5'd17;
-		6'd13: status_ch = dac9_activity_cnt[7:4];
-		6'd14: status_ch = dac9_activity_cnt[3:0];
-		6'd15: status_ch = 5'd17;
-		6'd16: status_ch = dbg_snd_int0_pin ? 5'd1 : 5'd0;
-		6'd17: status_ch = 5'd17;
-		6'd18: status_ch = dbg_snd_intc_request[7:4];
-		6'd19: status_ch = dbg_snd_intc_request[3:0];
-		6'd20: status_ch = 5'd17;
-		6'd21: status_ch = dbg_snd_intc_in_service[7:4];
-		6'd22: status_ch = dbg_snd_intc_in_service[3:0];
-		// 23-29: EXT0/EXT1 ctrl registers (bit3=MSK, bit4=LTM) +
-		// poll_pending (=intr) -- see the port comment above for why
-		// these were added (Fable sanity-check finding, round-2
-		// hardware read). intc_ext0/1_ctrl are only 7 bits so the
-		// top-nibble hex digit only ever shows 0 or 1 (bit6=SFNM).
-		6'd23: status_ch = {1'b0, dbg_snd_intc_ext0_ctrl[6:4]};
-		6'd24: status_ch = dbg_snd_intc_ext0_ctrl[3:0];
-		6'd25: status_ch = 5'd17;
-		6'd26: status_ch = {1'b0, dbg_snd_intc_ext1_ctrl[6:4]};
-		6'd27: status_ch = dbg_snd_intc_ext1_ctrl[3:0];
-		6'd28: status_ch = dbg_snd_intc_poll_pending ? 5'd1 : 5'd0;
-		6'd29: status_ch = 5'd17;
-		// Sound-command history (2026-07-17, freeze investigation):
-		// {hi0,lo0} older command, {hi1,lo1} most recent -- compare
-		// directly against the MAME-captured freeze-point sequence
-		// (0x71/0x83, 0x71/0x51, 0x71/0x92, then later 0x51/0xd6).
-		6'd30: status_ch = dbg_snd_cmd_hist[31:28];
-		6'd31: status_ch = dbg_snd_cmd_hist[27:24];
-		6'd32: status_ch = dbg_snd_cmd_hist[23:20];
-		6'd33: status_ch = dbg_snd_cmd_hist[19:16];
-		6'd34: status_ch = 5'd17;
-		6'd35: status_ch = dbg_snd_cmd_hist[15:12];
-		6'd36: status_ch = dbg_snd_cmd_hist[11:8];
-		6'd37: status_ch = dbg_snd_cmd_hist[7:4];
-		6'd38: status_ch = dbg_snd_cmd_hist[3:0];
-		6'd39: status_ch = 5'd17;
-		default: status_ch = 5'd17;
-	endcase
-end
-
-// Second always-on status row (vc 8..15): the runaway-PC trap. See the
-// dbg_jump_from port comment for the layout.
-wire       in_status_row2 = (vc >= 9'd8) && (vc < 9'd16);
-wire [5:0] s2_char_idx    = hc[8:3];
-wire [2:0] s2_row_y       = vc[2:0];
-
-reg [4:0] s2_ch;
-always @(*) begin
-	case (s2_char_idx)
-		6'd0 : s2_ch = dbg_jump_from[15:12];
-		6'd1 : s2_ch = dbg_jump_from[11:8];
-		6'd2 : s2_ch = dbg_jump_from[7:4];
-		6'd3 : s2_ch = dbg_jump_from[3:0];
-		6'd5 : s2_ch = dbg_jump_to[15:12];
-		6'd6 : s2_ch = dbg_jump_to[11:8];
-		6'd7 : s2_ch = dbg_jump_to[7:4];
-		6'd8 : s2_ch = dbg_jump_to[3:0];
-		6'd10: s2_ch = dbg_sled_trapped ? 5'd1 : 5'd0;
-		6'd12: s2_ch = {2'b00, dbg_m_bank_reg}; // Master bank_reg, 1 hex char
-		// chars 14-17: per-frame fg-pen checksum of the copyright-text
-		// region (see fgck_* block near fg_pen) -- compare against the
-		// sim-expected value on the first title screen.
-		6'd14: s2_ch = {1'b0, fgck_lat[15:12]};
-		6'd15: s2_ch = {1'b0, fgck_lat[11:8]};
-		6'd16: s2_ch = {1'b0, fgck_lat[7:4]};
-		6'd17: s2_ch = {1'b0, fgck_lat[3:0]};
-		6'd19: s2_ch = {1'b0, dbg_live_mm[11:8]};
-		6'd20: s2_ch = {1'b0, dbg_live_mm[7:4]};
-		6'd21: s2_ch = {1'b0, dbg_live_mm[3:0]};   // poll-count nibble: must visibly spin
-		// Stall-detector snapshot (freeze investigation): 23-26 = frozen
-		// Master PC, 28 = mvport_stall, 29 = cur_side, 30 = seq_state.
-		6'd23: s2_ch = {1'b0, dbg_stall_pc[15:12]};
-		6'd24: s2_ch = {1'b0, dbg_stall_pc[11:8]};
-		6'd25: s2_ch = {1'b0, dbg_stall_pc[7:4]};
-		6'd26: s2_ch = {1'b0, dbg_stall_pc[3:0]};
-		6'd28: s2_ch = {4'b0, dbg_stall_flags[4]};   // mvport_stall
-		6'd29: s2_ch = {4'b0, dbg_stall_flags[3]};   // cur_side
-		6'd30: s2_ch = {2'b0, dbg_stall_flags[2:0]}; // seq_state
-		6'd31: s2_ch = {2'b0, dbg_stall_bank};       // bank_reg -- resolves dbg_stall_pc's bank
-		// WRAM dump: 32-33 = $E712 (flag byte), 35-38 = $E715:E716
-		// (16-bit list pointer, high byte first).
-		6'd32: s2_ch = {1'b0, dbg_wram_dump[23:20]};
-		6'd33: s2_ch = {1'b0, dbg_wram_dump[19:16]};
-		6'd35: s2_ch = {1'b0, dbg_wram_dump[15:12]};
-		6'd36: s2_ch = {1'b0, dbg_wram_dump[11:8]};
-		6'd37: s2_ch = {1'b0, dbg_wram_dump[7:4]};
-		6'd38: s2_ch = {1'b0, dbg_wram_dump[3:0]};
-		default: s2_ch = 5'd17; // space
-	endcase
-end
-
-wire [34:0] s2_glyph    = font_glyph(s2_ch);
-wire  [5:0] s2_bit_pos  = {3'd0, s2_row_y} * 6'd5 + {3'd0, hc[2:0]};
-wire        s2_pixel    = (hc[2:0] < 3'd5) && (s2_row_y < 3'd7) &&
-                           s2_glyph[34 - s2_bit_pos];
-
-wire [34:0] status_glyph = font_glyph(status_ch);
-wire  [2:0] status_col   = hc[2:0];
-wire  [5:0] status_bit_pos = {3'd0, status_row_y} * 6'd5 + {3'd0, status_col};
-wire        status_pixel = (status_col < 3'd5) && (status_row_y < 3'd7) &&
-                            status_glyph[34 - status_bit_pos];
-
-// Third always-on status row (vc 16..23): sound-CPU liveness taps (see
-// the dbg_snd_audiocpu_reset_n/dbg_snd_core_bus_activity/
-// dbg_snd_rom_fetch_activity port comments above). Layout:
-//   0: dbg_snd_audiocpu_reset_n (0/1) -- did /RESET ever release
-//   2-3: core_bus_activity_cnt (2 hex, saturating) -- is Core issuing
-//        ANY bus transaction at all
-//   5-6: rom_fetch_activity_cnt (2 hex, saturating) -- is the sound
-//        ROM's SDRAM channel (CH_RD3) actually delivering bytes
-//   8-11: dbg_snd_core_ip (4 hex) -- the 80186's own live instruction
-//        pointer (rtl/s80x86/Core.sv's ip_current, tapped via
-//        hierarchical reference in sor_sound.sv). Round-3 read showed
-//        reset_n=1 and both activity counters saturated at 0xFF (CPU
-//        confirmed alive, ROM fetches confirmed working) but zero DAC
-//        activity -- this can't tell "genuine forward progress through
-//        boot code" from "stuck looping over a tiny address range"
-//        (e.g. a wait/error handler); compare this value across two
-//        screenshots a few seconds apart, same convention as row 1's
-//        Master PC.
-// 1/4/7/12-39 blank.
-wire       in_status_row3 = (vc >= 9'd16) && (vc < 9'd24);
-wire [5:0] s3_char_idx    = hc[8:3];
-wire [2:0] s3_row_y       = vc[2:0];
-
-reg [4:0] s3_ch;
-always @(*) begin
-	case (s3_char_idx)
-		6'd0: s3_ch = dbg_snd_audiocpu_reset_n ? 5'd1 : 5'd0;
-		6'd2: s3_ch = core_bus_activity_cnt[7:4];
-		6'd3: s3_ch = core_bus_activity_cnt[3:0];
-		6'd5: s3_ch = rom_fetch_activity_cnt[7:4];
-		6'd6: s3_ch = rom_fetch_activity_cnt[3:0];
-		6'd8: s3_ch = dbg_snd_core_ip[15:12];
-		6'd9: s3_ch = dbg_snd_core_ip[11:8];
-		6'd10: s3_ch = dbg_snd_core_ip[7:4];
-		6'd11: s3_ch = dbg_snd_core_ip[3:0];
-		default: s3_ch = 5'd17; // space
-	endcase
-end
-
-wire [34:0] s3_glyph   = font_glyph(s3_ch);
-wire  [5:0] s3_bit_pos = {3'd0, s3_row_y} * 6'd5 + {3'd0, hc[2:0]};
-wire        s3_pixel   = (hc[2:0] < 3'd5) && (s3_row_y < 3'd7) &&
-                          s3_glyph[34 - s3_bit_pos];
-
 always @(posedge clk_sys) begin
 	if (ce_pix) begin
-		if (HBlank || VBlank) begin
+		if (in_overlay_area) begin
+			rgb <= ov_pixel ? 24'hFFFFFF : 24'h000000;
+		end else if (HBlank || VBlank) begin
 			rgb <= 24'd0;
-		end else if (SHOW_STATUS_ROWS && in_status_row) begin
-			rgb <= status_pixel ? 24'h00FFFF : 24'd0;
-		end else if (SHOW_STATUS_ROWS && in_status_row2) begin
-			// Amber while live, red once the trap has fired -- so a crash is
-			// obvious at a glance without decoding the hex.
-			rgb <= s2_pixel ? (dbg_sled_trapped ? 24'hFF4040 : 24'hFFAA00) : 24'd0;
-		end else if (SHOW_STATUS_ROWS && in_status_row3) begin
-			rgb <= s3_pixel ? 24'h80FF80 : 24'd0; // pale green -- visually distinct from rows 1/2
-		end else if (!SHOW_DEBUG_OVERLAY) begin
-			rgb <= {col_r, col_g, col_b};
-		end else if (in_dbg_row) begin
-			// Debug overlay takes priority over everything in top 16 rows
-			rgb <= dbg_pixel;
-		end else if (in_pc_row) begin
-			rgb <= in_pc_col ? (pc_bit_val ? 24'hFFFFFF : 24'h333333) : 24'd0;
-		end else if (in_rom_row) begin
-			rgb <= in_rom_col ? (rom_bit_val ? 24'hFFCC00 : 24'h333333) : 24'd0;
-		end else if (in_io_row) begin
-			rgb <= in_io_col ? (io_bit_val ? io_bit_color : 24'h333333) : 24'd0;
-		end else if (in_chk_row) begin
-			rgb <= in_wrchk_col ? (wrchk_bit_val ? 24'hFFAA00 : 24'h333333) :
-			       in_rdchk_col ? (rdchk_bit_val ? 24'h00CCFF : 24'h333333) :
-			       in_match_col ? match_color :
-			                      24'd0;
-		end else if (in_chk_even_row) begin
-			// Solid full-width green/red (not a narrow 16px indicator column)
-			// -- the bit-pattern + narrow-indicator style used by the other
-			// checksum rows proved impossible to read reliably off a photo
-			// of the overlay; this can't be misjudged.
-			rgb <= in_q_col ? match_even_color : 24'd0;
-		end else if (in_chk_odd_row) begin
-			rgb <= in_q_col ? match_odd_color : 24'd0;
-		end else if (in_q_row) begin
-			rgb <= in_q_col ? q_color : 24'd0;
-		end else if (in_bt_row) begin
-			rgb <= in_bt_ind_col  ? bt_ind_color :
-			       in_bt_data_col ? (bt_bit_val ? 24'hFFFFFF : 24'h333333) :
-			                        24'd0;
-		end else if (in_text_row) begin
-			rgb <= text_pixel ? 24'hFFFFFF : 24'd0;
-		end else if (in_scan_row) begin
-			rgb <= scan_pixel ? 24'hFFFFFF : 24'd0;
-		end else if (in_wrb_row) begin
-			rgb <= wrb_pixel ? 24'hFFFF00 : 24'd0;
-		end else if (in_early_row) begin
-			rgb <= early_pixel ? 24'h00FF88 : 24'd0;
-		end else if (in_imm_row) begin
-			rgb <= imm_pixel ? 24'hFF00FF : 24'd0;
-		end else if (in_rd2cnt_row) begin
-			rgb <= rd2cnt_pixel ? 24'h00FFFF : 24'd0;
-		end else if (in_a2_row) begin
-			rgb <= a2_pixel ? 24'hFF8800 : 24'd0;
-		end else if (in_dls_row) begin
-			rgb <= dls_pixel ? 24'hAAFF00 : 24'd0;
-		end else if (in_btp_row) begin
-			rgb <= btp_pixel ? 24'hFF00AA : 24'd0;
 		end else begin
 			rgb <= {col_r, col_g, col_b};
 		end

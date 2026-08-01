@@ -312,6 +312,9 @@ set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_core.v
 set_global_assignment -name VERILOG_FILE rtl/tv80s_ce.v
 set_global_assignment -name SYSTEMVERILOG_FILE SuperOffRoad.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_banked.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/leland_board_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/rom_line_cache.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_board.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_master.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sor_slave.sv
@@ -322,10 +325,17 @@ set_global_assignment -name EDA_NETLIST_WRITER_OUTPUT_DIR simulation/modelsim -s
 set_global_assignment -name EDA_OUTPUT_DATA_FORMAT "VERILOG HDL" -section_id eda_simulation
 set_global_assignment -name EDA_SIMULATION_TOOL "<None>"
 set_global_assignment -name EDA_TIME_SCALE "1 ps" -section_id eda_simulation
-set_global_assignment -name FITTER_EFFORT "FAST FIT"
+## WP-L3 96MHz investigation (2026-07-22): FAST FIT / FAST synthesis
+## effort were implicated in a genuine internal setup violation
+## (read_capture_sr -> rdata_reg's DDIO ena pin, -6.6ns at 96MHz) that
+## TWO different RTL retiming attempts failed to fix -- both times
+## Quartus placed the retiming register in the same bad spot, which
+## pointed at placement/synthesis effort rather than register structure
+## as the actual cause. Switched to standard effort to test that theory
+## before trying anything more invasive (LogicLock regions, etc).
 set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"
 set_global_assignment -name OPTIMIZATION_MODE BALANCED
 set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT NORMAL
-set_global_assignment -name SYNTHESIS_EFFORT FAST
+set_global_assignment -name SYNTHESIS_EFFORT AUTO
 set_global_assignment -name TOP_LEVEL_ENTITY sys_top
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top

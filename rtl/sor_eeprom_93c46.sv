@@ -23,32 +23,18 @@ module sor_eeprom_93c46
 	input        cs,      // chip select (MCONT bit6)
 	input        clk_in,  // serial clock (MCONT bit5)
 	input        di,      // data in (MCONT bit4)
-	output reg   do_out   // data out (GIN3 bit0)
+	output reg   do_out,  // data out (GIN3 bit0)
+
+	// WP-L3: per-game default-content load port. sor_board.sv's boot FSM
+	// writes all 64 words here (from the MRA-delivered image at
+	// leland_board_pkg::ADDR_EEPROM_BASE) before releasing the CPUs --
+	// replaces the old offroad-only hardcoded initial block.
+	input        mem_wr,
+	input  [5:0] mem_wr_addr,
+	input [15:0] mem_wr_data
 );
 
 reg [15:0] mem [0:63];
-initial begin
-	// Default content == sim/eeprom-offroad.bin (128 bytes, CRC 57955248),
-	// the same default image documented in mra/SuperOffRoad.mra. Big-
-	// endian byte pairs (matches leland_m.cpp's eeprom_data[o*2+0]=hi,
-	// [o*2+1]=lo convention).
-	mem[0]=16'h07BB; mem[1]=16'hF483; mem[2]=16'hFFFF; mem[3]=16'hFFFF;
-	mem[4]=16'hFFFF; mem[5]=16'hFFFF; mem[6]=16'hFFFF; mem[7]=16'hFFFF;
-	mem[8]=16'hFFFF; mem[9]=16'hFEFE; mem[10]=16'hFFFB; mem[11]=16'hFFFF;
-	mem[12]=16'hFFFF; mem[13]=16'h00FF; mem[14]=16'hFFFB; mem[15]=16'hFFFF;
-	mem[16]=16'hFFFF; mem[17]=16'hFFFF; mem[18]=16'hFFFF; mem[19]=16'hFFFF;
-	mem[20]=16'hFFFF; mem[21]=16'hFFFF; mem[22]=16'hFFFF; mem[23]=16'hFFFF;
-	mem[24]=16'hFFFF; mem[25]=16'hFFFF; mem[26]=16'hFFFF; mem[27]=16'hFFFF;
-	mem[28]=16'hFFFF; mem[29]=16'hFFFF; mem[30]=16'hFFFF; mem[31]=16'hFFFF;
-	mem[32]=16'hFFFF; mem[33]=16'hFFFF; mem[34]=16'hFFFF; mem[35]=16'hFFFF;
-	mem[36]=16'hFFFF; mem[37]=16'hFFFF; mem[38]=16'hFFFF; mem[39]=16'hFFFF;
-	mem[40]=16'hFFFF; mem[41]=16'hFFFF; mem[42]=16'hFFFF; mem[43]=16'hFFFF;
-	mem[44]=16'hFFFF; mem[45]=16'hFFFF; mem[46]=16'hFFFF; mem[47]=16'hFFFF;
-	mem[48]=16'hFFFF; mem[49]=16'hFFFF; mem[50]=16'hFFFF; mem[51]=16'hFFFF;
-	mem[52]=16'hFFFF; mem[53]=16'hFFFF; mem[54]=16'hFEFF; mem[55]=16'hFEFE;
-	mem[56]=16'hFFFE; mem[57]=16'h50FF; mem[58]=16'h976C; mem[59]=16'hFFAD;
-	mem[60]=16'hFFFF; mem[61]=16'hFFFF; mem[62]=16'hFFFF; mem[63]=16'hFFFF;
-end
 
 localparam S_WAIT_START = 0, S_CMD = 1, S_DATA = 2;
 reg [1:0]  state;
@@ -64,6 +50,15 @@ wire clk_rise = clk_in & ~clk_prev;
 
 always @(posedge clk_sys) begin
 	clk_prev <= clk_in;
+
+	// WP-L3: boot-time default-content load (sor_board.sv's ee_st FSM).
+	// Single driver for mem[] -- merged into this block rather than a
+	// separate always @(posedge clk_sys), which Quartus correctly
+	// rejects as multiple constant drivers on the same net (ModelSim
+	// doesn't catch this at simulation time, only real synthesis does).
+	// mem_wr only pulses during boot, well before cs/clk_in ever toggle,
+	// so there's no real overlap with the S_DATA WRITE path below.
+	if (mem_wr) mem[mem_wr_addr] <= mem_wr_data;
 
 	if (reset || !cs) begin
 		state    <= S_WAIT_START;

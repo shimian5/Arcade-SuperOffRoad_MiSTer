@@ -28,3 +28,10 @@ derive_clock_uncertainty
 ## Matches the pattern used by Arcade-IGSPGM_MiSTer and other Sorgelig cores.
 set_false_path -to   [get_ports {SDRAM_CLK SDRAM_A[*] SDRAM_BA[*] SDRAM_nCS SDRAM_nRAS SDRAM_nCAS SDRAM_nWE SDRAM_DQML SDRAM_DQMH SDRAM_DQ[*]}]
 set_false_path -from [get_ports {SDRAM_DQ[*]}]
+
+## WP-L3's dedicated 96MHz clock domain (outclk_2/clk_sdram_ctrl) + async
+## CDC bridge was reverted 2026-07-22 -- back to the original 2-output PLL
+## (outclk_0=clk_sys, outclk_1=phase-shifted SDRAM_CLK forward, both
+## 48MHz), so the clock-group carve-out this section used to need is gone
+## too; the blanket false-path above already covers the single remaining
+## SDRAM_CLK/DQ relationship.

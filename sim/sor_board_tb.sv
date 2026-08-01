@@ -29,20 +29,42 @@
 
 module sor_board_tb;
 
-localparam CLK_PERIOD = 20.83; // 48 MHz
+//----------------------------------------------------------------------
+// Run length (2026-07-24). Was three hardcoded constants (790 ms report
+// point, 800 ms run end, 2 s boot-watchdog), which capped every run at
+// ~0.8 s of sim time. That is far short of what the pigout
+// slowdown/artifact investigation needs: reset-to-attract is several
+// SECONDS of real time, so those symptoms were unreachable by
+// construction. Override with e.g. `+define+RUN_LEN_MS=7000` for a 7 s
+// run; the default reproduces the previous behavior exactly.
+//
+// Beware the wall-clock cost: ModelSim advances this testbench at only
+// ~0.44 ms of sim time per wall-clock second, so RUN_LEN_MS=7000 is
+// roughly 4.4 HOURS. Verilator (see the Verilator notes in
+// docs/SESSION_2026-07-24_PIGOUT_INVESTIGATION_HANDOFF.md) is the way to
+// make runs this long routine rather than overnight.
+//----------------------------------------------------------------------
+`ifndef RUN_LEN_MS
+  `define RUN_LEN_MS 790
+`endif
+localparam time REPORT_AT_NS = `RUN_LEN_MS * 1_000_000;  // report tasks fire here
+localparam time RUN_END_NS   = REPORT_AT_NS + 10_000_000; // +10 ms, as before
+localparam time WATCHDOG_NS  = REPORT_AT_NS * 3;          // was 2 s vs a 790 ms report
+
+localparam CLK_PERIOD = 20.83; // 48 MHz -- clk_sys
 
 reg clk_sys = 0;
 always #(CLK_PERIOD/2) clk_sys = ~clk_sys;
 
-// clk_sdram: mirrors whichever outclk_1 phase the real PLL ladder build
-// (docs/sdram_plan.md Section 3a) is currently using. B6 = 60 deg
-// (clk_sdram lags clk_sys by 1/6 period, 3.472ns) -- update alongside
-// pll_0002.v's phase_shift1 for each later ladder step (B3=180deg was
-// `~clk_sys`, B4=0deg was `clk_sys` directly, B5=90deg was a
-// quarter-period lag).
+// clk_sdram: phase-shifted 48 MHz PLL output feeding SDRAM_CLK
+// (docs/sdram_plan.md Section 3a; WP-L3's dedicated 96MHz clock/CDC
+// bridge scheme was reverted 2026-07-22). This testbench's Micron-ideal
+// SDRAM model has no realistic setup/hold/tAC margin checking, so it
+// cannot distinguish a correctly- from an incorrectly-phased clk_sdram --
+// this mirror is for documentation/consistency only, not verification.
 reg clk_sdram = 0;
 initial begin
-	#(CLK_PERIOD/6); // 60 deg = 1/6-period lag
+	#(3.472); // same absolute delay as pll_0002.v's phase_shift1="3472 ps"
 	forever #(CLK_PERIOD/2) clk_sdram = ~clk_sdram;
 end
 
@@ -62,6 +84,7 @@ wire        SDRAM_CLK, SDRAM_CKE, SDRAM_nCS, SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE, 
 
 wire        ce_pix, HBlank, HSync, VBlank, VSync;
 wire [23:0] rgb;
+wire signed [15:0] audio_out;
 
 // DL_SETTLE_CYCLES defaults to 12,000,000 clk_sys cycles (250ms) on
 // real hardware -- sized for worst-case multi-session download
@@ -111,7 +134,13 @@ sor_board #(.USE_ALTDDIO(1'b0), .DL_SETTLE_CYCLES(24'd10000)) dut
 	.p1_pedal(8'h00), .p2_pedal(8'h00), .p3_pedal(8'h00),
 
 	.service(1'b0),
-	.free_play(1'b0)
+	.free_play(1'b0),
+
+	// Debug overlay (2026-07-25) defaults off in sim -- tb doesn't exercise
+	// the render path, only avoids leaving the port undriven.
+	.show_overlay(1'b0),
+
+	.audio_out(audio_out)
 );
 
 mt48lc16m16a2 chip
@@ -130,15 +159,21 @@ mt48lc16m16a2 chip
 
 //------------------------------------------------------------------
 // Full flat ROM image loaded in one ioctl_download session, matching
-// the MRA's single index="0" entry.  Place all files in sim/.
+// the MRA's single index="0" entry (16-byte header + canonical
+// leland_board_pkg layout, WP-L1).  Place all files in sim/.
 //
-// Flat layout (offsets match sor_board.sv localparam ADDR_* values):
-//   0x000000-0x03FFFF  Master Z80 ROM  (4 x 64KB)   -> SDRAM
-//   0x040000-0x0BFFFF  Slave  Z80 ROM  (1x8KB + fill + 5x64KB) -> SDRAM
-//   0x0C0000-0x1BFFFF  Sound ROM       (3 interleaved lo/hi pairs) -> SDRAM
-//   0x1C0000-0x1D7FFF  GFX tile ROM    (3 x 32KB)    -> BRAM
-//   0x1D8000-0x1F7FFF  BG palette PROM (4 x 16KB + fills) -> BRAM
+// Layout (offsets match rtl/leland_board_pkg.sv's canonical ADDR_*
+// values; all addresses below the header are ioctl stream addresses,
+// i.e. HDR_LEN + <region-relative address>):
+//   0x000000-0x00000F  16-byte board-ID header
+//   0x000010-0x03FFFF  Master Z80 ROM  (4 x 64KB)   -> SDRAM
+//   0x100010-0x1BFFFF  Slave  Z80 ROM  (1x8KB + fill + 5x64KB) -> SDRAM
+//   0x300010-0x3FFFFF  Sound ROM       (3 interleaved lo/hi pairs) -> SDRAM
+//   0x400010-0x417FFF  GFX tile ROM    (3 x 32KB)    -> BRAM
+//   0x600010-0x61FFFF  BG palette PROM (4 x 16KB + fills) -> BRAM
 //------------------------------------------------------------------
+localparam [26:0] HDR_LEN = 27'd16;
+
 integer i;
 integer fd, rd_count;
 
@@ -153,6 +188,17 @@ task ioctl_fill_zero(input [26:0] start_addr, input integer len);
 		ioctl_seed_addr(start_addr);
 		for (j = 0; j < len; j = j + 1)
 			ioctl_write_byte(start_addr + j, 8'h00);
+	end
+endtask
+
+// Helper: write a fixed 16-byte array literally, starting at flat_addr --
+// used for the WP-L1 board-ID header (rtl/leland_board_pkg.sv HDR_LEN).
+task ioctl_load_bytes(input bit [7:0] bytes_ [0:15], input [26:0] start_addr);
+	integer j;
+	begin
+		ioctl_seed_addr(start_addr);
+		for (j = 0; j < 16; j = j + 1)
+			ioctl_write_byte(start_addr + j, bytes_[j]);
 	end
 endtask
 
@@ -311,7 +357,11 @@ endtask
 `endif
 
 // Helper: read a ROM file and stream it starting at flat_addr
-task ioctl_load_file(input [8*32-1:0] fname, input [26:0] flat_addr, input integer expected_len);
+// fname is 64 chars (not 32) so out-of-tree ROM paths fit -- pigout's ROMs
+// live in ../roms_src/pigout/ rather than sim/, and "../roms_src/pigout/
+// 03-29020-0x.u58t" is 35 chars. Shorter literals right-justify with leading
+// NULs, which $fopen strips, exactly as they already did at 32 chars.
+task ioctl_load_file(input [8*64-1:0] fname, input [26:0] flat_addr, input integer expected_len);
 	integer j;
 	begin
 		fd = $fopen(fname, "rb");
@@ -342,7 +392,7 @@ endtask
 // one already-flat file verbatim.
 reg [7:0] pair_lo_buf [0:65535];
 reg [7:0] pair_hi_buf [0:65535];
-task ioctl_load_pair(input [8*32-1:0] lo_fname, input [8*32-1:0] hi_fname, input [26:0] flat_addr);
+task ioctl_load_pair(input [8*64-1:0] lo_fname, input [8*64-1:0] hi_fname, input [26:0] flat_addr);
 	integer lo_fd, hi_fd, lo_count, hi_count, k;
 	begin
 		lo_fd = $fopen(lo_fname, "rb");
@@ -417,6 +467,16 @@ task ioctl_write_byte(input [26:0] addr, input [7:0] data);
 	end
 endtask
 
+// Slave PC latch, tapped hierarchically off the M1-fetch condition.
+reg [15:0] slave_dbg_pc;
+always @(posedge clk_sys)
+	if (dut.slave.CE_6M && ~dut.slave.mreq_n && ~dut.slave.m1_n) slave_dbg_pc <= dut.slave.cpu_addr;
+
+// Master PC latch, same M1-fetch pattern as slave_dbg_pc above.
+reg [15:0] master_dbg_pc;
+always @(posedge clk_sys)
+	if (dut.master.CE_6M && ~dut.master.mreq_n && ~dut.master.m1_n) master_dbg_pc <= dut.master.cpu_addr;
+
 //------------------------------------------------------------------
 // Master CPU boot trace: watches every I/O write the Master Z80
 // makes (port address + data) and flags the two we care about most —
@@ -429,7 +489,7 @@ always @(posedge clk_sys) begin
 	if (dut.master.CE_6M && dut.master.io_wr) begin
 		io_wr_count = io_wr_count + 1;
 		$display("t=%0t IOWR #%0d addr=0x%02x data=0x%02x pc=0x%04x%s%s",
-		          $time, io_wr_count, dut.master.cpu_addr[7:0], dut.master.cpu_dout, dut.dbg_pc,
+		          $time, io_wr_count, dut.master.cpu_addr[7:0], dut.master.cpu_dout, master_dbg_pc,
 		          dut.master.io_bank  ? "  <- BANK"  : "",
 		          dut.master.io_mcont ? "  <- MCONT" : "");
 	end
@@ -447,12 +507,12 @@ reg [7:0]  last_io_rd_addr = 8'hzz;
 reg [15:0] last_io_rd_pc   = 16'hzzzz;
 always @(posedge clk_sys) begin
 	if (!reset && dut.master.CE_6M && dut.master.io_rd &&
-	    (dut.master.cpu_addr[7:0] != last_io_rd_addr || dut.dbg_pc != last_io_rd_pc)) begin
+	    (dut.master.cpu_addr[7:0] != last_io_rd_addr || master_dbg_pc != last_io_rd_pc)) begin
 		io_rd_count = io_rd_count + 1;
 		$display("t=%0t IORD #%0d addr=0x%02x data=0x%02x pc=0x%04x",
-		          $time, io_rd_count, dut.master.cpu_addr[7:0], dut.master.cpu_din, dut.dbg_pc);
+		          $time, io_rd_count, dut.master.cpu_addr[7:0], dut.master.cpu_din, master_dbg_pc);
 		last_io_rd_addr = dut.master.cpu_addr[7:0];
-		last_io_rd_pc   = dut.dbg_pc;
+		last_io_rd_pc   = master_dbg_pc;
 	end
 end
 
@@ -468,15 +528,6 @@ always @(posedge clk_sys) begin
 			          $time, vram_wr_count, dut.vram_addr_cpu, dut.vram_din_cpu);
 	end
 end
-
-// Slave PC latch (tapped hierarchically -- kept even though sor_slave.sv
-// now also exposes a dbg_pc output of its own (Follow-up 6), since this
-// local copy predates that port and several other monitors below already
-// reference it; the two are driven by the identical M1-fetch condition
-// so they always agree).
-reg [15:0] slave_dbg_pc;
-always @(posedge clk_sys)
-	if (dut.slave.CE_6M && ~dut.slave.mreq_n && ~dut.slave.m1_n) slave_dbg_pc <= dut.slave.cpu_addr;
 
 // Follow-up 6 (docs/SESSION_2026-07-14.md), Task 2 -- organic bank-switch
 // monitor: does a real `ld ($C000),a` executed by the tv80 core actually
@@ -496,21 +547,6 @@ always @(posedge clk_sys) begin
 	end
 end
 
-// First-occurrence evidence for the other half of Task 2's question:
-// does a subsequent banked-window (0x10000-0x7FFFF via in_banked) ROM
-// read actually return nonzero data once bank_reg has organically
-// changed? dut.slave.dbg_banked_read_ever is the sticky flag (new
-// sor_slave.sv output); log the exact moment/address/data it first
-// goes high.
-reg banked_read_ever_prev;
-initial banked_read_ever_prev = 1'b0;
-always @(posedge clk_sys) begin
-	if (dut.slave.dbg_banked_read_ever && !banked_read_ever_prev) begin
-		$display("t=%0t FIRST_BANKED_ROM_READ bank_reg=%0d rom_addr=0x%05x rom_data=0x%02x slavePC=0x%04x",
-		          $time, dut.slave.bank_reg, dut.slave.rom_addr, dut.slave.rom_data, slave_dbg_pc);
-	end
-	banked_read_ever_prev = dut.slave.dbg_banked_read_ever;
-end
 
 // Follow-up 9b -- does the Slave EVER execute the real title-art blit
 // routine at all? MAME's fg_bitmap_pc_histogram.lua (C:\MiSTerDev\mame)
@@ -741,12 +777,12 @@ always @(posedge clk_sys) begin
 	// executing either command writer (0x61A0-0x61C8 status commands,
 	// 0x6238-0x6290 sprite command). q0_a is the actual VRAM address.
 	if (dut.vp_pop_m && !dut.master.mvport.q0_rd &&
-	    ((dut.dbg_pc >= 16'h61A0 && dut.dbg_pc <= 16'h61C8) ||
-	     (dut.dbg_pc >= 16'h6238 && dut.dbg_pc <= 16'h6290))) begin
+	    ((master_dbg_pc >= 16'h61A0 && master_dbg_pc <= 16'h61C8) ||
+	     (master_dbg_pc >= 16'h6238 && master_dbg_pc <= 16'h6290))) begin
 		f10_mwr_count = f10_mwr_count + 1;
 		if (f10_mwr_count <= 2500)
 			$display("t=%0t F10_MWR #%0d vaddr=0x%04x data=0x%02x mpc=0x%04x",
-			          $time, f10_mwr_count, dut.master.mvport.q0_a, dut.master.mvport.q0_d, dut.dbg_pc);
+			          $time, f10_mwr_count, dut.master.mvport.q0_a, dut.master.mvport.q0_d, master_dbg_pc);
 	end
 end
 
@@ -789,14 +825,14 @@ end
 integer f10c_cnt = 0;
 always @(posedge clk_sys) begin
 	if ((dut.master.mvport.wr_commit || dut.master.mvport.rd_commit) &&
-	    ((dut.dbg_pc >= 16'h61A0 && dut.dbg_pc <= 16'h61C8) ||
-	     (dut.dbg_pc >= 16'h6238 && dut.dbg_pc <= 16'h6290))) begin
+	    ((master_dbg_pc >= 16'h61A0 && master_dbg_pc <= 16'h61C8) ||
+	     (master_dbg_pc >= 16'h6238 && master_dbg_pc <= 16'h6290))) begin
 		f10c_cnt = f10c_cnt + 1;
 		if (f10c_cnt <= 300)
 			$display("t=%0t F10C_COMMIT wr=%b rd=%b cpu_addr=0x%04x op=%0d addr_q=0x%04x dout=0x%02x q1_v_pre=%b mpc=0x%04x",
 			          $time, dut.master.mvport.wr_commit, dut.master.mvport.rd_commit,
 			          dut.master.cpu_addr, dut.master.mvport.op, dut.master.mvport.addr_q,
-			          dut.master.cpu_dout, dut.master.mvport.q1_v, dut.dbg_pc);
+			          dut.master.cpu_dout, dut.master.mvport.q1_v, master_dbg_pc);
 	end
 end
 
@@ -871,7 +907,7 @@ always @(posedge clk_sys) begin
 			end
 			if (f13_out_count <= 60 || dut.slave.cpu_dout != 8'h00)
 				$display("t=%0t F13_VRAM_OUT #%0d cpu_dout=0x%02x pc=0x%04x bank_reg=0x%0x HL=0x%02x%02x DE=0x%02x%02x  last_rom(addr=0x%05x data=0x%02x age=%0dns seen=%b)",
-				          $time, f13_out_count, dut.slave.cpu_dout, dut.slave.dbg_pc, dut.slave.bank_reg,
+				          $time, f13_out_count, dut.slave.cpu_dout, slave_dbg_pc, dut.slave.bank_reg,
 				          dut.slave.slave_cpu.i_tv80_core.i_reg.H, dut.slave.slave_cpu.i_tv80_core.i_reg.L,
 				          dut.slave.slave_cpu.i_tv80_core.i_reg.D, dut.slave.slave_cpu.i_tv80_core.i_reg.E,
 				          f13_last_rom_addr, f13_last_rom_data, $time - f13_last_rom_time, f13_rom_read_seen);
@@ -1010,8 +1046,8 @@ reg [15:0] f17_entry_hist_pc [0:63];
 integer f17_entry_hist_time_ms [0:63];
 integer f17_hist_idx = 0;
 always @(posedge clk_sys) begin
-	if (dut.dbg_pc !== f17_pc_prev) begin
-		if ((dut.dbg_pc >= 16'h6100 && dut.dbg_pc <= 16'h6300) &&
+	if (master_dbg_pc !== f17_pc_prev) begin
+		if ((master_dbg_pc >= 16'h6100 && master_dbg_pc <= 16'h6300) &&
 		    !(f17_pc_prev >= 16'h6100 && f17_pc_prev <= 16'h6300)) begin
 			f17_entry_count = f17_entry_count + 1;
 			f17_last_entry_time = $time;
@@ -1023,9 +1059,9 @@ always @(posedge clk_sys) begin
 			end
 			if (f17_entry_count <= 300 || (f17_entry_count % 500 == 0))
 				$display("t=%0t F17_ENTRY #%0d from_pc=0x%04x to_pc=0x%04x",
-				          $time, f17_entry_count, f17_pc_prev, dut.dbg_pc);
+				          $time, f17_entry_count, f17_pc_prev, master_dbg_pc);
 		end
-		f17_pc_prev <= dut.dbg_pc;
+		f17_pc_prev <= master_dbg_pc;
 	end
 end
 time f17_periodic_last = 0;
@@ -1131,7 +1167,7 @@ always @(posedge clk_sys) begin
 	    (dut.wram_addr_m >= 12'h900 && dut.wram_addr_m <= 12'h907)) begin
 		f19_wr_count_m = f19_wr_count_m + 1;
 		$display("t=%0t F19_E900WR_MASTER #%0d addr=0xE%03x data=0x%02x mpc=0x%04x",
-		          $time, f19_wr_count_m, dut.wram_addr_m, dut.wram_din_m, dut.dbg_pc);
+		          $time, f19_wr_count_m, dut.wram_addr_m, dut.wram_din_m, master_dbg_pc);
 	end
 end
 
@@ -1246,9 +1282,9 @@ integer f15_mout_count = 0;
 always @(posedge clk_sys) begin
 	if (dut.vp_pop_m && !dut.master.mvport.q0_rd) begin
 		f15_mout_count = f15_mout_count + 1;
-		if (f15_mout_count <= 200 || (dut.dbg_pc < 16'h61A0 || (dut.dbg_pc > 16'h61C8 && dut.dbg_pc < 16'h6238) || dut.dbg_pc > 16'h6290))
+		if (f15_mout_count <= 200 || (master_dbg_pc < 16'h61A0 || (master_dbg_pc > 16'h61C8 && master_dbg_pc < 16'h6238) || master_dbg_pc > 16'h6290))
 			$display("t=%0t F15_MOUT_ANY #%0d vaddr=0x%04x data=0x%02x mpc=0x%04x bank=0x%0x",
-			          $time, f15_mout_count, dut.master.mvport.q0_a, dut.master.mvport.q0_d, dut.dbg_pc, dut.master.bank_reg);
+			          $time, f15_mout_count, dut.master.mvport.q0_a, dut.master.mvport.q0_d, master_dbg_pc, dut.master.bank_reg);
 	end
 end
 
@@ -1282,7 +1318,7 @@ always @(posedge clk_sys) begin
 		stale_rd_count_m = stale_rd_count_m + 1;
 		if (stale_rd_count_m <= 100)
 			$display("t=%0t F16_STALE_RD_MASTER #%0d addr=0x%04x stale_value=0x%02x mpc=0x%04x",
-			          $time, stale_rd_count_m, pending_rd_addr_m, dut.master.mvport.rd_data, dut.dbg_pc);
+			          $time, stale_rd_count_m, pending_rd_addr_m, dut.master.mvport.rd_data, master_dbg_pc);
 	end
 	io_rd_prev_m <= dut.master.io_rd;
 
@@ -1297,7 +1333,7 @@ always @(posedge clk_sys) begin
 		stale_rd_count_s = stale_rd_count_s + 1;
 		if (stale_rd_count_s <= 100)
 			$display("t=%0t F16_STALE_RD_SLAVE #%0d addr=0x%04x stale_value=0x%02x spc=0x%04x",
-			          $time, stale_rd_count_s, pending_rd_addr_s, dut.slave.vport.rd_data, dut.slave.dbg_pc);
+			          $time, stale_rd_count_s, pending_rd_addr_s, dut.slave.vport.rd_data, slave_dbg_pc);
 	end
 	io_rd_prev_s <= dut.slave.io_rd;
 end
@@ -1358,9 +1394,9 @@ end
 // every posedge clk_sys would print the same logical write several
 // times over (this is the "historical double-execution issue" the
 // design has seen elsewhere). Edge-detect it here (0->1 on wram_we)
-// so each logical write prints exactly once. dut.master.dbg_pc is the
+// so each logical write prints exactly once. master_dbg_pc is the
 // PC latched at the instruction's opcode fetch (M1), i.e. the PC of
-// the instruction doing the write; dut.master.dbg_bank is the live
+// the instruction doing the write; dut.master.bank_reg is the live
 // bank register at that same moment.
 // ============================================================
 reg e973_we_d;
@@ -1373,7 +1409,7 @@ always @(posedge clk_sys) begin
 		    dut.master.wram_addr >= 12'h973 && dut.master.wram_addr <= 12'h976) begin
 			$display("E973TRACE t=%0t addr=%04x data=%02x pc=%04x bank=%0d",
 			          $time, {4'hE, dut.master.wram_addr}, dut.master.wram_din,
-			          dut.master.dbg_pc, dut.master.dbg_bank);
+			          master_dbg_pc, dut.master.bank_reg);
 		end
 	end
 end
@@ -1399,8 +1435,19 @@ reg scan_vb_d = 0, scan_hb_d = 0;
 always @(posedge clk_sys) begin
 	scan_vb_d <= dut.video.VBlank;
 	scan_hb_d <= dut.video.HBlank;
+	// Arm before the report point rather than at a hardcoded 770 ms, so a long
+	// RUN_LEN_MS run captures a frame near ITS end (i.e. in attract/gameplay)
+	// instead of during early boot.
+	//
+	// MARGIN (2026-07-24, learned the hard way): must be at least TWO frames.
+	// A frame is 424*256/7.159 MHz = 15.16 ms, and arming happens at the first
+	// VBlank rise AFTER the threshold, so a 20 ms margin can leave as little as
+	// ~5 ms -- not enough. The first 30 s run armed at t=29.988 s with only
+	// 12 ms left and captured just 180 of 240 display lines, cutting off exactly
+	// the bottom-of-screen region the pigout artifact lives in (~line 200-210,
+	// just above the HUD). 40 ms guarantees a complete frame.
 	if (!scan_done_r && !scan_active &&
-	    $time >= 770ms && dut.video.VBlank && !scan_vb_d) begin
+	    $time >= (REPORT_AT_NS - 40_000_000) && dut.video.VBlank && !scan_vb_d) begin
 		scan_active <= 1;
 		scan_fd = $fopen("scanout_frame.bin", "wb");
 		$display("=== SCANOUT_DUMP armed, capture starts t=%0t ===", $time);
@@ -1420,6 +1467,166 @@ always @(posedge clk_sys) begin
 	end
 end
 `endif // SCANOUT_DUMP
+
+// ============================================================
+// RD2_DEADLINE_MONITOR -- verification-only instrumentation added for the
+// rd2 aging/priority-boost work (see rtl/sor_board.sv's rd2_age_cnt/
+// rd2_boost block). sor_video_tb.sv's pixel-diff test runs sor_video.sv
+// in isolation (no real CPU bus contention) so it structurally cannot
+// catch a missed video-fetch deadline caused by arbiter contention --
+// this monitor closes that gap by watching the REAL dut.sdram_rd2_req
+// line under genuine master/slave/sound CPU contention in this
+// board-level testbench.
+//
+// Tracks, in clk_sys cycles, how long dut.sdram_rd2_req has been
+// asserted-but-ungranted (mirrors rd2_pending in sor_board.sv). Flags a
+// "missed deadline" if that ever exceeds ~54 clk_sys cycles (sor_video.sv's
+// own LEAD=8 arm-to-commit budget) -- i.e. exactly the failure mode
+// attempt 2 (fixed-bottom rd2 priority) hit on real hardware.
+integer rd2_wait_cnt;
+integer rd2_max_wait;
+integer rd2_missed_deadlines;
+localparam integer RD2_DEADLINE_CYCLES = 54;
+initial begin
+	rd2_wait_cnt = 0;
+	rd2_max_wait = 0;
+	rd2_missed_deadlines = 0;
+end
+always @(posedge clk_sys) begin
+	if (dut.sdram_rd2_req && !dut.sdram_rd2_ack) begin
+		rd2_wait_cnt <= rd2_wait_cnt + 1;
+		if (rd2_wait_cnt + 1 > rd2_max_wait) rd2_max_wait <= rd2_wait_cnt + 1;
+		if (rd2_wait_cnt + 1 == RD2_DEADLINE_CYCLES + 1) begin
+			rd2_missed_deadlines <= rd2_missed_deadlines + 1;
+			$display("t=%0t RD2_DEADLINE_MISS wait=%0d cycles (budget=%0d)",
+			         $time, rd2_wait_cnt + 1, RD2_DEADLINE_CYCLES);
+		end
+	end else begin
+		rd2_wait_cnt <= 0;
+	end
+end
+// Summary just ahead of the 800ms safety-timeout point, so it prints on
+// every run regardless of which $finish path the rest of the testbench
+// takes (there are many, scattered through the boot-trace instrumentation
+// above -- this is the one guaranteed-to-run checkpoint before the end).
+initial begin
+	#REPORT_AT_NS;
+	$display("=== RD2_DEADLINE_SUMMARY missed=%0d max_wait_cycles=%0d budget_cycles=%0d ===",
+	          rd2_missed_deadlines, rd2_max_wait, RD2_DEADLINE_CYCLES);
+end
+
+// WHOLE-TILE-FETCH deadline monitor (2026-07-22): the rd2_wait_cnt monitor
+// above resets on every sdram_rd2_ack, so it only ever measures a SINGLE
+// one of the 4 serialized SDRAM reads (prom + 3 gfx planes) per tile
+// fetch (rtl/sor_video.sv's fetch_ph drops sdram_rd2_req_r for exactly
+// one cycle between each sub-read -- see FP_PROM_WAIT/FP_GFX0_WAIT/etc).
+// That is a real blind spot: the actual correctness deadline is that ALL
+// 4 reads finish within the 54-cycle arm-to-commit budget, not that each
+// individual read's own arbitration wait stays under 54 -- a per-sub-read
+// monitor can show "missed=0" while the tile as a whole blows the budget.
+// This tracks from the cycle fetch_ph leaves FP_IDLE (arm fires) to the
+// cycle it returns to FP_IDLE (all 4 reads done), the true quantity
+// rtl/sor_video.sv's commit-gate fix (2026-07-22, gating the tile commit
+// on fetch_ph==FP_IDLE) depends on landing inside budget.
+integer tile_fetch_cyc;
+integer tile_fetch_max;
+integer tile_fetch_missed;
+reg     tile_fetch_active;
+initial begin
+	tile_fetch_cyc    = 0;
+	tile_fetch_max    = 0;
+	tile_fetch_missed = 0;
+	tile_fetch_active = 1'b0;
+end
+always @(posedge clk_sys) begin
+	if (dut.video.fetch_ph != 4'd0) begin // != FP_IDLE
+		tile_fetch_active <= 1'b1;
+		tile_fetch_cyc    <= tile_fetch_cyc + 1;
+		if (tile_fetch_cyc + 1 > tile_fetch_max) tile_fetch_max <= tile_fetch_cyc + 1;
+		if (tile_fetch_cyc + 1 == RD2_DEADLINE_CYCLES + 1) begin
+			tile_fetch_missed <= tile_fetch_missed + 1;
+			$display("t=%0t TILE_FETCH_DEADLINE_MISS wait=%0d cycles (budget=%0d)",
+			         $time, tile_fetch_cyc + 1, RD2_DEADLINE_CYCLES);
+		end
+	end else begin
+		tile_fetch_active <= 1'b0;
+		tile_fetch_cyc    <= 0;
+	end
+end
+initial begin
+	#REPORT_AT_NS;
+	$display("=== TILE_FETCH_DEADLINE_SUMMARY missed=%0d max_wait_cycles=%0d budget_cycles=%0d ===",
+	          tile_fetch_missed, tile_fetch_max, RD2_DEADLINE_CYCLES);
+end
+
+`ifdef RD2_STRESS
+// ============================================================
+// RD2_STRESS -- synthetic adversarial rd0/rd1/rd3 traffic (2026-07-21).
+//
+// WHY: the coordinator's request was to stress the rd2_age_cnt/rd2_boost
+// aging-arbiter margin (rtl/sor_board.sv) under WORST-CASE rd0/rd1/rd3
+// contention, without waiting for real attract-mode gameplay to organically
+// produce that contention -- at this testbench's simulation speed
+// (~4-5s wall-clock per 1ms simulated), waiting ~26s of real elapsed time
+// for attract mode to even start would take over a day of wall-clock time.
+// GAMEPLAY_REPRO's injected-snapshot approach (see inject_gameplay_snapshot
+// above) still only produces whatever contention the real ROM code happens
+// to generate; this mode instead FORCES the three other read channels to
+// saturate the arbiter as hard as the real client protocol allows --
+// back-to-back requests with only the minimum 1-idle-cycle gap the
+// in_flight release logic requires -- concurrently with sor_video's real,
+// unmodified rd2 fetch FSM, which keeps running normally (it only depends
+// on ce_pix/reset, not on CPU program correctness). Master/Slave/Sound CPU
+// correctness is irrelevant and expected to be garbage in this mode --
+// forcing their sdram_rd0_req/rd1_req/rd3_req wires from outside overrides
+// their own real request logic, so their actual ROM fetches never get
+// through, but that's fine: this run only reads dut.sdram_rd2_req/ack
+// timing (via the existing RD2_DEADLINE_MONITOR above), not game behavior.
+//
+// Each generator: force req high, wait for its own ack pulse (proof the
+// arbiter granted and completed that transaction), drop req for exactly
+// one clk_sys cycle (the minimum gap in_flight's release logic depends on
+// -- see sor_board.sv's in_flight/issued_req_level comment), then
+// immediately re-assert. This is the tightest back-to-back request pattern
+// the real protocol permits, i.e. deliberately worse than any real CPU can
+// produce (a real CPU's own stall logic has its own minimum-gap overhead
+// beyond just the 1-cycle protocol floor).
+//------------------------------------------------------------------
+reg rd2_stress_start = 1'b0;
+
+initial begin : rd0_stress_gen
+	wait (rd2_stress_start);
+	forever begin
+		force dut.sdram_rd0_addr = 25'h0000010;
+		force dut.sdram_rd0_req  = 1'b1;
+		@(posedge clk_sys iff dut.sdram_rd0_ack);
+		force dut.sdram_rd0_req  = 1'b0;
+		@(posedge clk_sys);
+	end
+end
+
+initial begin : rd1_stress_gen
+	wait (rd2_stress_start);
+	forever begin
+		force dut.sdram_rd1_addr = 25'h0100010;
+		force dut.sdram_rd1_req  = 1'b1;
+		@(posedge clk_sys iff dut.sdram_rd1_ack);
+		force dut.sdram_rd1_req  = 1'b0;
+		@(posedge clk_sys);
+	end
+end
+
+initial begin : rd3_stress_gen
+	wait (rd2_stress_start);
+	forever begin
+		force dut.sdram_rd3_addr = 25'h0300010;
+		force dut.sdram_rd3_req  = 1'b1;
+		@(posedge clk_sys iff dut.sdram_rd3_ack);
+		force dut.sdram_rd3_req  = 1'b0;
+		@(posedge clk_sys);
+	end
+end
+`endif // RD2_STRESS
 
 `ifdef FGCK_TRACE
 // Prints sor_video's copyright-region fg checksum (the on-hardware
@@ -1455,7 +1662,7 @@ end
 // several CE_6M ticks per fetch, so this must be edge-detected here
 // too, same reasoning as e973_we_d above. dut.master.cpu_addr is the
 // live PC at that exact fetch (stable across the whole m1_fetch_now
-// pulse); dut.master.dbg_bank is the live bank register.
+// pulse); dut.master.bank_reg is the live bank register.
 // ============================================================
 reg        m1r_fetch_d;
 integer    m1r_page_hist[0:15];
@@ -1476,7 +1683,7 @@ always @(posedge clk_sys) begin
 		if (dut.master.m1_fetch_now && !m1r_fetch_d) begin
 			m1r_page_hist[dut.master.cpu_addr[15:12]] = m1r_page_hist[dut.master.cpu_addr[15:12]] + 1;
 			if (dut.master.cpu_addr >= 16'h5C00 && dut.master.cpu_addr <= 16'h5F7F) begin
-				$display("M1R t=%0t pc=%04x bank=%0d", $time, dut.master.cpu_addr, dut.master.dbg_bank);
+				$display("M1R t=%0t pc=%04x bank=%0d", $time, dut.master.cpu_addr, dut.master.bank_reg);
 			end
 		end
 
@@ -1743,7 +1950,7 @@ always @(posedge clk_sys) begin
 		if (cram_attempt_count <= 20 || (cram_attempt_count % 500 == 0))
 			$display("t=%0t CRAM_WR #%0d addr=0x%04x(cramidx=%0d) data=0x%02x mcont_bit1=%0d pc=0x%04x %s",
 			          $time, cram_attempt_count, dut.master.cpu_addr, dut.master.cpu_addr[9:0],
-			          dut.master.cpu_dout, dut.master.mcont_r[1], dut.master.dbg_pc_r,
+			          dut.master.cpu_dout, dut.master.mcont_r[1], master_dbg_pc,
 			          dut.master.mcont_r[1] ? "LANDED" : "BLOCKED");
 	end
 	cram_attempt_prev = cram_attempt;
@@ -1842,27 +2049,6 @@ always @(posedge clk_sys) begin
 	end
 end
 
-// TEMP diagnostic: confirmed root cause of the periodic Master restart
-// -- rom_data at cpu_addr=0x2036 settles to 0xD0 instead of the real
-// (file-verified-correct) 0xC3, specifically under heavy concurrent
-// Master+Slave+video SDRAM traffic (never reproduced during quiet
-// early-boot reads). The reset port itself was proven clean (no
-// glitches), so this is a genuine SDRAM arbiter/controller race.
-// Log the FULL arbiter state every cycle any read channel is active,
-// windowed tightly around the known corruption timestamp (~810.26ms)
-// to catch it without flooding the log across the whole run.
-always @(posedge clk_sys) begin
-	if ($time > 810_200_000 && $time < 810_300_000 &&
-	    (dut.sdram_rd0_req || dut.sdram_rd1_req || dut.sdram_rd2_req || dut.sdram_wr_req || dut.in_flight)) begin
-		$display("t=%0t ARB in_flight=%b issued_ch=%0d done_seen=%b sd_ready=%b sd_req_done=%b sd_rd=%b sd_we_word=%b sd_addr=0x%06x sd_dout=0x%02x rd0_req=%b rd0_ack=%b rd0_addr=0x%06x rd1_req=%b rd1_ack=%b rd1_addr=0x%06x wr_req=%b wr_ack=%b",
-		          $time, dut.in_flight, dut.issued_ch, dut.done_seen, dut.sd_ready, dut.sd_req_done,
-		          dut.sd_rd, dut.sd_we_word, dut.sd_addr, dut.sd_dout,
-		          dut.sdram_rd0_req, dut.sdram_rd0_ack, dut.sdram_rd0_addr,
-		          dut.sdram_rd1_req, dut.sdram_rd1_ack, dut.sdram_rd1_addr,
-		          dut.sdram_wr_req, dut.sdram_wr_ack);
-	end
-end
-
 // Shared WRAM (0xE000-0xEFFF) read/write trace for both CPUs -- the two
 // CPUs went idle in lockstep right after the Slave's first VRAM-write
 // burst, with the Master's interrupts masked (intack_cnt stuck at 0),
@@ -1875,7 +2061,7 @@ always @(posedge clk_sys) begin
 		wram_wr_count_m = wram_wr_count_m + 1;
 		if (wram_wr_count_m <= 16 || (wram_wr_count_m % 20000 == 0))
 			$display("t=%0t WRAM_WR_M #%0d addr=0x%03x data=0x%02x pc=0x%04x",
-			          $time, wram_wr_count_m, dut.wram_addr_m, dut.wram_din_m, dut.dbg_pc);
+			          $time, wram_wr_count_m, dut.wram_addr_m, dut.wram_din_m, master_dbg_pc);
 	end
 	if (dut.slave.CE_6M && dut.wram_we_s) begin
 		wram_wr_count_s = wram_wr_count_s + 1;
@@ -1890,12 +2076,12 @@ reg [11:0] last_wram_rd_addr_m = 12'hzzz, last_wram_rd_addr_s = 12'hzzz;
 reg [15:0] last_wram_rd_pc_m   = 16'hzzzz, last_wram_rd_pc_s   = 16'hzzzz;
 always @(posedge clk_sys) begin
 	if (!reset && dut.master.CE_6M && dut.master.mem_access && ~dut.master.rd_n && dut.master.in_wram &&
-	    (dut.master.cpu_addr[11:0] != last_wram_rd_addr_m || dut.dbg_pc != last_wram_rd_pc_m)) begin
+	    (dut.master.cpu_addr[11:0] != last_wram_rd_addr_m || master_dbg_pc != last_wram_rd_pc_m)) begin
 		wram_rd_count_m = wram_rd_count_m + 1;
 		$display("t=%0t WRAM_RD_M #%0d addr=0x%03x data=0x%02x pc=0x%04x",
-		          $time, wram_rd_count_m, dut.master.cpu_addr[11:0], dut.wram_dout_m, dut.dbg_pc);
+		          $time, wram_rd_count_m, dut.master.cpu_addr[11:0], dut.wram_dout_m, master_dbg_pc);
 		last_wram_rd_addr_m = dut.master.cpu_addr[11:0];
-		last_wram_rd_pc_m   = dut.dbg_pc;
+		last_wram_rd_pc_m   = master_dbg_pc;
 	end
 	if (!reset && dut.slave.CE_6M && dut.slave.mem_access && ~dut.slave.rd_n && dut.slave.in_wram &&
 	    (dut.slave.cpu_addr[11:0] != last_wram_rd_addr_s || slave_dbg_pc != last_wram_rd_pc_s)) begin
@@ -1940,10 +2126,9 @@ end
 
 // Periodic PC sample so a hung/looping boot shows up as a narrow
 // repeating PC range instead of silence. Now covers both CPUs.
-// dbg_irq_cnt (Master raster/VA10 interrupt firing count), an intack
-// (M1&IORQ) cycle count, and the live periodic_int_n level are included
-// to distinguish "CPU stopped re-arming interrupts" (intack_count frozen,
-// periodic_int_n stuck low) from a genuine per-frame VBlank wait.
+// An intack (M1&IORQ) cycle count and the live periodic_int_n level are
+// included to distinguish "CPU stopped re-arming interrupts" (intack_count
+// frozen, periodic_int_n stuck low) from a genuine per-frame VBlank wait.
 `ifdef GAMEPLAY_REPRO
 // How long to let the injected snapshot run before giving up and
 // reporting a stall. $BDAB is hit many times per second in real
@@ -1987,9 +2172,9 @@ always @(posedge clk_sys) begin
 	if (dut.master.CE_6M && dut.master.io_wr && dut.master.io_mcont) mcont_wr_count = mcont_wr_count + 1;
 	if (dut.master.CE_6M && ~dut.master.iorq_n && ~dut.master.m1_n) intack_count = intack_count + 1;
 	if (!reset && (pc_sample_count % 200000 == 0))
-		$display("t=%0t PC_SAMPLE m_pc=0x%04x s_pc=0x%04x slave_reset_n=%b vram_wr_count=%0d irq_cnt=%0d intack_cnt=%0d periodic_int_n=%b gin3_rd=%0d mcont_wr=%0d vblank=%b",
-		          $time, dut.dbg_pc, slave_dbg_pc, dut.slave_reset_n, vram_wr_count,
-		          dut.dbg_irq_cnt, intack_count, dut.master.periodic_int_n, gin3_rd_count, mcont_wr_count, dut.VBlank);
+		$display("t=%0t PC_SAMPLE m_pc=0x%04x s_pc=0x%04x slave_reset_n=%b vram_wr_count=%0d intack_cnt=%0d periodic_int_n=%b gin3_rd=%0d mcont_wr=%0d vblank=%b",
+		          $time, master_dbg_pc, slave_dbg_pc, dut.slave_reset_n, vram_wr_count,
+		          intack_count, dut.master.periodic_int_n, gin3_rd_count, mcont_wr_count, dut.VBlank);
 	if (!reset) pc_sample_count = pc_sample_count + 1;
 end
 
@@ -2526,6 +2711,745 @@ initial begin
 end
 `endif // SLAVEBANKTEST
 
+// ============================================================
+// WP-M0: Open-row baseline measurement.
+//
+// Counts SDRAM ACTIVATE and READ commands observed on the physical pins,
+// broken down by bank, to quantify how many activates happen per read
+// before and after the open-row controller lands. Baseline (sdram_simple):
+// every read has its own ACTIVATE → 1:1 ratio. Open-row target: most
+// reads are page hits with no preceding ACTIVATE → ratio < 1.
+//
+// Command encoding: {nCS, nRAS, nCAS, nWE} active-low
+//   4'b0011 = ACTIVE (ACTIVATE)
+//   4'b0101 = READ
+//   4'b0010 = PRECHARGE
+// SDRAM_BA holds the bank address when ACTIVE/READ are issued.
+// ============================================================
+wire [3:0] sdram_cmd_pins = {SDRAM_nCS, SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE};
+localparam [3:0] SCMD_ACTIVE    = 4'b0011;
+localparam [3:0] SCMD_READ      = 4'b0101;
+localparam [3:0] SCMD_PRECHARGE = 4'b0010;
+
+integer wpm0_act_bank[0:3];
+integer wpm0_read_bank[0:3];
+integer wpm0_act_i;
+initial begin
+    for (wpm0_act_i = 0; wpm0_act_i < 4; wpm0_act_i = wpm0_act_i + 1) begin
+        wpm0_act_bank[wpm0_act_i]  = 0;
+        wpm0_read_bank[wpm0_act_i] = 0;
+    end
+end
+always @(posedge SDRAM_CLK) begin
+    if (sdram_cmd_pins == SCMD_ACTIVE && SDRAM_CKE)
+        wpm0_act_bank[SDRAM_BA]  <= wpm0_act_bank[SDRAM_BA]  + 1;
+    if (sdram_cmd_pins == SCMD_READ   && SDRAM_CKE)
+        wpm0_read_bank[SDRAM_BA] <= wpm0_read_bank[SDRAM_BA] + 1;
+end
+// Report at sim end (also printed at 790ms safety-net and $finish).
+task automatic wpm0_report;
+    $display("=== WP-M0 ACT/READ BASELINE ==================================================");
+    $display("  Bank 0 (master):  ACT=%0d  READ=%0d  ratio=%.3f",
+             wpm0_act_bank[0], wpm0_read_bank[0],
+             wpm0_read_bank[0] ? (1.0*wpm0_act_bank[0]/wpm0_read_bank[0]) : 0.0);
+    $display("  Bank 1 (slave):   ACT=%0d  READ=%0d  ratio=%.3f",
+             wpm0_act_bank[1], wpm0_read_bank[1],
+             wpm0_read_bank[1] ? (1.0*wpm0_act_bank[1]/wpm0_read_bank[1]) : 0.0);
+    $display("  Bank 2 (sound):   ACT=%0d  READ=%0d  ratio=%.3f",
+             wpm0_act_bank[2], wpm0_read_bank[2],
+             wpm0_read_bank[2] ? (1.0*wpm0_act_bank[2]/wpm0_read_bank[2]) : 0.0);
+    $display("  Bank 3 (gfx/wr):  ACT=%0d  READ=%0d  ratio=%.3f",
+             wpm0_act_bank[3], wpm0_read_bank[3],
+             wpm0_read_bank[3] ? (1.0*wpm0_act_bank[3]/wpm0_read_bank[3]) : 0.0);
+    $display("  Open-row target: ratio << 1 (most reads as page hits, no preceding ACT).");
+    $display("==============================================================================");
+endtask
+initial begin #REPORT_AT_NS; wpm0_report(); end
+
+//======================================================================
+// Master-Z80 stall census (2026-07-24, "pigout runs slower than MAME")
+//
+// Screen timing and CPU clock are both already confirmed exact against
+// MAME (7.159 MHz pixel clock / 424x256 => 65.955 Hz; master Z80 at
+// 48/8 = 6.000 MHz vs MAME's XTAL(12'000'000)/2), so neither can explain
+// a wall-clock difference. The only remaining mechanism is *lost CPU
+// cycles*: tv80s_ce advances only on a CE_6M tick with wait_n high, so
+// every CE_6M tick taken while stalled is a 6 MHz cycle MAME never loses
+// (its memory model has zero latency).
+//
+// The two stall sources are NOT equivalent and are counted separately:
+//   rom   -- (rom_req & rom_stall), i.e. SDRAM not ready for a code/data
+//            ROM read. This is purely our implementation's cost; neither
+//            MAME nor the real board pays it.
+//   mvport-- the VRAM mailbox port holding the CPU in /WAIT. The REAL
+//            board does this too, so a delta here is not automatically
+//            a bug -- but MAME's timing model still doesn't charge for it.
+//
+// Counting starts when ioctl_download deasserts so the ROM-load writes
+// aren't included, keeping offroad and pigout windows comparable.
+//======================================================================
+integer stall_ce_total;   // CE_6M ticks observed
+integer stall_ce_rom;     // ...of which stalled on ROM/SDRAM
+integer stall_ce_mvport;  // ...of which stalled on the VRAM mailbox port
+integer stall_ce_both;    // ...both asserted at once (counted in each above)
+reg     stall_census_arm;
+
+initial begin
+	stall_ce_total   = 0;
+	stall_ce_rom     = 0;
+	stall_ce_mvport  = 0;
+	stall_ce_both    = 0;
+	stall_census_arm = 0;
+end
+
+// CORRECTION (2026-07-24, after the first offroad run): arming on
+// !ioctl_download was WRONG for the gfx census. sor_video is held in reset
+// until `video_release` (~155 ms, gated on repack_done -- see
+// rtl/sor_board.sv:1709-1712, "hc/vc are held at 0 the entire time"), so
+// during that whole window hc and col_in_tile sit at 0 and
+// `fifo_pop_req = ce_pix && (col_in_tile==0) && (hc < H_ACTIVE)` is TRUE on
+// EVERY ce_pix tick -- ~7.159 MHz x 155 ms = ~1.1M phantom pops against an
+// empty buffer. That swamped the real signal: the first offroad run reported
+// 67.4% "underruns" for a game that renders correctly on hardware.
+// Arm on video_release instead so only real display activity is counted.
+// (The vc histogram was immune to this, since every phantom pop lands in the
+// vc=0 bin and can simply be discarded.)
+always @(posedge clk_sys) begin
+	if (!ioctl_download && dut.video_release) stall_census_arm <= 1'b1;
+
+	if (stall_census_arm && dut.CE_6M) begin
+		stall_ce_total <= stall_ce_total + 1;
+		if (dut.master.rom_req && dut.master.rom_stall)
+			stall_ce_rom <= stall_ce_rom + 1;
+		if (dut.master.mvport_stall)
+			stall_ce_mvport <= stall_ce_mvport + 1;
+		if (dut.master.rom_req && dut.master.rom_stall && dut.master.mvport_stall)
+			stall_ce_both <= stall_ce_both + 1;
+	end
+end
+
+//======================================================================
+// SLAVE-Z80 stall census (2026-07-24, added after the master census came
+// back at 0.012% yet the user still reports pigout "feels slower")
+//
+// WHY THIS EXISTS -- the master census has a blind spot. It measures only
+// the MASTER losing cycles to memory waits. Three ways to be slow that it
+// reports as ~0%:
+//   1. The master polls a handshake and the RESPONDER is slow. The master
+//      is executing, not stalled -- full speed by that metric.
+//   2. The SLAVE is the bottleneck. It has its own independent stall path
+//      (rtl/sor_slave.sv:129) which nothing was measuring.
+//   3. Per-frame work overruns the frame, so game logic slips to every
+//      other vblank -- a ~50% speed drop with zero memory stalls.
+//
+// The slave is the drawing CPU in Leland and master<->slave communicate
+// through SHARED VRAM (rtl/sor_board.sv:1538, mailbox ~0xEF06), so the
+// VRAM port sits on the handshake's critical path. `vport_stall` here is
+// therefore the prime suspect for a whole-game slowdown, and it is
+// counted separately from ROM/SDRAM stalls for the same reason as on the
+// master: only one of the two is our own artifact.
+//======================================================================
+integer sl_ce_total, sl_stall_rom, sl_stall_vport, sl_stall_both;
+
+initial begin
+	sl_ce_total    = 0;
+	sl_stall_rom   = 0;
+	sl_stall_vport = 0;
+	sl_stall_both  = 0;
+end
+
+always @(posedge clk_sys) begin
+	if (stall_census_arm && dut.CE_6M) begin
+		sl_ce_total <= sl_ce_total + 1;
+		if (dut.slave.rom_read_cyc && dut.slave.rom_stall)
+			sl_stall_rom <= sl_stall_rom + 1;
+		if (dut.slave.vport_stall)
+			sl_stall_vport <= sl_stall_vport + 1;
+		if (dut.slave.rom_read_cyc && dut.slave.rom_stall && dut.slave.vport_stall)
+			sl_stall_both <= sl_stall_both + 1;
+	end
+end
+
+task automatic slave_stall_report;
+	integer stalled_any;
+	real    frac;
+	begin
+		stalled_any = sl_stall_rom + sl_stall_vport - sl_stall_both;
+		frac = sl_ce_total ? (1.0 * stalled_any / sl_ce_total) : 0.0;
+		$display("==============================================================================");
+		$display("SLAVE Z80 STALL CENSUS");
+		$display("  CE_6M ticks observed:      %0d", sl_ce_total);
+		$display("  stalled on ROM/SDRAM:      %0d", sl_stall_rom);
+		$display("  stalled on VRAM port:      %0d", sl_stall_vport);
+		$display("  both at once (overlap):    %0d", sl_stall_both);
+		$display("  stalled on anything:       %0d  (%.3f%% of ticks)", stalled_any, 100.0*frac);
+		$display("  => effective slave clock:  %.4f MHz vs MAME's 6.0000 MHz", 6.0*(1.0-frac));
+		$display("  The slave is Leland's DRAWING CPU and master<->slave talk through shared");
+		$display("  VRAM, so a large `VRAM port` figure here would slow the whole game while");
+		$display("  leaving the master census near 0%% -- exactly the reported symptom.");
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; slave_stall_report(); end
+
+task automatic stall_report;
+	integer stalled_any;
+	real    frac;
+	begin
+		// rom+mvport double-counts the overlap, so subtract it back out
+		stalled_any = stall_ce_rom + stall_ce_mvport - stall_ce_both;
+		frac = stall_ce_total ? (1.0 * stalled_any / stall_ce_total) : 0.0;
+		$display("==============================================================================");
+		$display("MASTER Z80 STALL CENSUS");
+		$display("  CE_6M ticks observed:      %0d", stall_ce_total);
+		$display("  stalled on ROM/SDRAM:      %0d", stall_ce_rom);
+		$display("  stalled on VRAM mailbox:   %0d", stall_ce_mvport);
+		$display("  both at once (overlap):    %0d", stall_ce_both);
+		$display("  stalled on anything:       %0d  (%.3f%% of ticks)", stalled_any, 100.0*frac);
+		$display("  => effective master clock: %.4f MHz vs MAME's 6.0000 MHz", 6.0*(1.0-frac));
+		$display("  Compare this figure offroad vs pigout: a pigout-only excess of a few");
+		$display("  percent is the ~1s-per-25s intro gap; near-identical figures mean the");
+		$display("  reported slowdown is not coming from CPU throughput at all.");
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; stall_report(); end
+
+//======================================================================
+// PER-FRAME SLACK instrumentation (2026-07-25, STEP 2 of the
+// docs/SESSION_2026-07-24_PIGOUT_INVESTIGATION_HANDOFF.md re-prioritization).
+//
+// The stall census above answers "what fraction of CE_6M ticks are lost to
+// SDRAM contention" -- a THROUGHPUT number. It does NOT answer whether that
+// throughput loss is observable. If the master finishes its per-frame work
+// with cycles to spare every frame (i.e. it's already idling/polling before
+// VBlank), losing 2% of throughput just eats into idle time and produces
+// ~0% perceived slowdown. If the master's work barely fits inside a frame,
+// the same 2% loss can push it past VBlank and the game slips to every
+// OTHER frame -- a ~50% perceived slowdown from a 2% throughput loss. This
+// is the "cliff, not slope" question the handoff doc identifies as decisive
+// and NOT yet measured.
+//
+// Method (generic, needs no game reverse engineering, per the handoff doc):
+// per video frame (VBlank rise to VBlank rise), record total CE_6M ticks,
+// stalled CE_6M ticks, and the number of DISTINCT PCs the master visited in
+// the PCWIN M1-fetches immediately preceding the VBlank rise. A tight
+// wait/spin loop (polling for VBlank, e.g.) revisits a handful of PCs
+// over and over -- few distinct PCs => real slack that frame. Saturated
+// work right up to VBlank visits many distinct PCs in that same window.
+//======================================================================
+localparam integer PCWIN = 64;              // M1-fetch window sampled before each VBlank rise
+localparam integer SPIN_UNIQUE_THRESH = 16; // <= this many distinct PCs in the window => "spinning" (has slack)
+// (2026-07-25: raised from 8 -- the first real run showed active gameplay's own
+// steady-state poll loop uses 9-11 distinct PCs, which an 8-threshold mislabeled
+// as "saturated." 16 gives margin above that while still well below the 64-cap
+// that genuine end-to-end saturation approaches. Read the raw unique_pc_last64
+// distribution in the per-frame log lines regardless -- don't trust the binary
+// verdict alone.)
+
+reg [15:0] fslack_pcwin [0:PCWIN-1];
+integer    fslack_pcwin_idx;
+
+integer fslack_ce_total;
+integer fslack_ce_stalled;
+integer fslack_frame_num;
+integer fslack_spin_frames;
+integer fslack_busy_frames;
+integer fslack_min_unique;
+integer fslack_max_unique;
+reg     fslack_vb_d;
+reg     fslack_arm;
+
+initial begin
+	fslack_pcwin_idx   = 0;
+	fslack_ce_total    = 0;
+	fslack_ce_stalled  = 0;
+	fslack_frame_num   = 0;
+	fslack_spin_frames = 0;
+	fslack_busy_frames = 0;
+	fslack_min_unique  = PCWIN + 1;
+	fslack_max_unique  = 0;
+	fslack_vb_d        = 0;
+	fslack_arm         = 0;
+end
+
+// Sample the master's M1-fetch PC into a small circular window every
+// fetch, regardless of frame boundary -- cheap, and always keeps the
+// window fresh for whenever the next VBlank rise lands.
+always @(posedge clk_sys) begin
+	if (dut.master.CE_6M && ~dut.master.mreq_n && ~dut.master.m1_n) begin
+		fslack_pcwin[fslack_pcwin_idx] <= dut.master.cpu_addr;
+		fslack_pcwin_idx <= (fslack_pcwin_idx == PCWIN-1) ? 0 : fslack_pcwin_idx + 1;
+	end
+end
+
+task automatic fslack_count_unique(output integer n_unique);
+	integer i, j;
+	reg found;
+	begin
+		n_unique = 0;
+		for (i = 0; i < PCWIN; i = i + 1) begin
+			found = 1'b0;
+			for (j = 0; j < i; j = j + 1)
+				if (fslack_pcwin[j] == fslack_pcwin[i]) found = 1'b1;
+			if (!found) n_unique = n_unique + 1;
+		end
+	end
+endtask
+
+always @(posedge clk_sys) begin
+	fslack_vb_d <= dut.video.VBlank;
+	// Same arming point as the stall census: real display activity only,
+	// not the ~155ms video-reset window (see stall_census_arm above).
+	if (!ioctl_download && dut.video.VBlank && !fslack_vb_d) fslack_arm <= 1'b1;
+
+	if (fslack_arm && dut.CE_6M) begin
+		fslack_ce_total <= fslack_ce_total + 1;
+		if (dut.master.rom_req && dut.master.rom_stall)
+			fslack_ce_stalled <= fslack_ce_stalled + 1;
+	end
+
+	if (fslack_arm && dut.video.VBlank && !fslack_vb_d) begin
+		// VBlank rise: close out the frame that just ended (skip frame 0,
+		// which is a partial frame from the moment fslack_arm went high).
+		if (fslack_frame_num > 0) begin
+			automatic integer n_unique;
+			fslack_count_unique(n_unique);
+			if (n_unique < fslack_min_unique) fslack_min_unique <= n_unique;
+			if (n_unique > fslack_max_unique) fslack_max_unique <= n_unique;
+			if (n_unique <= SPIN_UNIQUE_THRESH) fslack_spin_frames <= fslack_spin_frames + 1;
+			else                                fslack_busy_frames <= fslack_busy_frames + 1;
+			$display("t=%0t FRAME_SLACK frame=%0d ce_total=%0d ce_stalled=%0d stall_pct=%.3f unique_pc_last%0d=%0d %s",
+			          $time, fslack_frame_num, fslack_ce_total, fslack_ce_stalled,
+			          fslack_ce_total ? (100.0*fslack_ce_stalled/fslack_ce_total) : 0.0,
+			          PCWIN, n_unique, (n_unique <= SPIN_UNIQUE_THRESH) ? "SPIN(slack)" : "BUSY(saturated)");
+		end
+		fslack_frame_num  <= fslack_frame_num + 1;
+		fslack_ce_total   <= 0;
+		fslack_ce_stalled <= 0;
+	end
+end
+
+task automatic fslack_report;
+	integer total_frames;
+	begin
+		total_frames = fslack_spin_frames + fslack_busy_frames;
+		$display("==============================================================================");
+		$display("PER-FRAME SLACK SUMMARY (STEP 2 of the pink-line/speed investigation)");
+		$display("  frames measured:            %0d", total_frames);
+		$display("  frames with slack (SPIN):   %0d  (<= %0d distinct PCs in last %0d M1 fetches)",
+		          fslack_spin_frames, SPIN_UNIQUE_THRESH, PCWIN);
+		$display("  frames saturated (BUSY):    %0d  (> %0d distinct PCs)",
+		          fslack_busy_frames, SPIN_UNIQUE_THRESH);
+		$display("  unique-PC range observed:   min=%0d max=%0d (of %0d-entry window)",
+		          fslack_min_unique, fslack_max_unique, PCWIN);
+		if (total_frames == 0) begin
+			$display("  ** NO FRAMES MEASURED -- run is too short to cross a full VBlank-to-VBlank");
+			$display("     interval past the arming point. Lengthen RUN_LEN_MS. **");
+		end else if (fslack_busy_frames == 0) begin
+			$display("  => EVERY frame shows slack. The 2%% SDRAM throughput loss is being");
+			$display("     absorbed by idle time, not costing a frame. If the game still feels");
+			$display("     slower, look elsewhere (slave/sound handshake, not master throughput).");
+		end else if (fslack_spin_frames == 0) begin
+			$display("  => NO frame shows slack -- every frame is saturated end-to-end. This is");
+			$display("     the CLIFF regime: consistent with throughput loss pushing per-frame");
+			$display("     work past VBlank and slipping to every other frame.");
+		end else begin
+			$display("  => MIXED: some frames have slack, some are saturated. Check whether BUSY");
+			$display("     frames cluster (e.g. during heavy on-screen movement) -- that would");
+			$display("     tie the cliff to specific game moments rather than being constant.");
+		end
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; fslack_report(); end
+
+//======================================================================
+// SLAVE per-frame slack census (2026-07-25) -- mirrors the master fslack_*
+// block above using the SAME VBlank-rise frame boundary, but tracks the
+// SLAVE Z80 (dut.slave.*). The slave is Leland's drawing CPU and sits on
+// the master<->slave VRAM mailbox handshake, so it's the biggest gap left
+// in the master-only per-frame-slack finding above (see doc: master shows
+// slack every frame, but the slave has only ever had an AGGREGATE stall
+// figure, never a per-frame one).
+//======================================================================
+reg [15:0] sfslack_pcwin [0:PCWIN-1];
+integer    sfslack_pcwin_idx;
+
+integer sfslack_ce_total;
+integer sfslack_ce_stalled;
+integer sfslack_spin_frames;
+integer sfslack_busy_frames;
+integer sfslack_min_unique;
+integer sfslack_max_unique;
+
+initial begin
+	sfslack_pcwin_idx   = 0;
+	sfslack_ce_total    = 0;
+	sfslack_ce_stalled  = 0;
+	sfslack_spin_frames = 0;
+	sfslack_busy_frames = 0;
+	sfslack_min_unique  = PCWIN + 1;
+	sfslack_max_unique  = 0;
+end
+
+always @(posedge clk_sys) begin
+	if (dut.slave.CE_6M && ~dut.slave.mreq_n && ~dut.slave.m1_n) begin
+		sfslack_pcwin[sfslack_pcwin_idx] <= dut.slave.cpu_addr;
+		sfslack_pcwin_idx <= (sfslack_pcwin_idx == PCWIN-1) ? 0 : sfslack_pcwin_idx + 1;
+	end
+end
+
+task automatic sfslack_count_unique(output integer n_unique);
+	integer i, j;
+	reg found;
+	begin
+		n_unique = 0;
+		for (i = 0; i < PCWIN; i = i + 1) begin
+			found = 1'b0;
+			for (j = 0; j < i; j = j + 1)
+				if (sfslack_pcwin[j] == sfslack_pcwin[i]) found = 1'b1;
+			if (!found) n_unique = n_unique + 1;
+		end
+	end
+endtask
+
+// Reuses fslack_arm/fslack_vb_d for the frame-boundary edge (same VBlank
+// signal, same arm condition -- no need for a second copy).
+always @(posedge clk_sys) begin
+	if (fslack_arm && dut.CE_6M) begin
+		sfslack_ce_total <= sfslack_ce_total + 1;
+		if (dut.slave.rom_read_cyc && dut.slave.rom_stall)
+			sfslack_ce_stalled <= sfslack_ce_stalled + 1;
+	end
+
+	if (fslack_arm && dut.video.VBlank && !fslack_vb_d) begin
+		if (fslack_frame_num > 0) begin
+			automatic integer n_unique;
+			sfslack_count_unique(n_unique);
+			if (n_unique < sfslack_min_unique) sfslack_min_unique <= n_unique;
+			if (n_unique > sfslack_max_unique) sfslack_max_unique <= n_unique;
+			if (n_unique <= SPIN_UNIQUE_THRESH) sfslack_spin_frames <= sfslack_spin_frames + 1;
+			else                                sfslack_busy_frames <= sfslack_busy_frames + 1;
+			$display("t=%0t SLAVE_FRAME_SLACK frame=%0d ce_total=%0d ce_stalled=%0d stall_pct=%.3f unique_pc_last%0d=%0d %s",
+			          $time, fslack_frame_num, sfslack_ce_total, sfslack_ce_stalled,
+			          sfslack_ce_total ? (100.0*sfslack_ce_stalled/sfslack_ce_total) : 0.0,
+			          PCWIN, n_unique, (n_unique <= SPIN_UNIQUE_THRESH) ? "SPIN(slack)" : "BUSY(saturated)");
+		end
+		sfslack_ce_total   <= 0;
+		sfslack_ce_stalled <= 0;
+	end
+end
+
+task automatic sfslack_report;
+	integer total_frames;
+	begin
+		total_frames = sfslack_spin_frames + sfslack_busy_frames;
+		$display("==============================================================================");
+		$display("SLAVE PER-FRAME SLACK SUMMARY");
+		$display("  frames measured:            %0d", total_frames);
+		$display("  frames with slack (SPIN):   %0d  (<= %0d distinct PCs in last %0d M1 fetches)",
+		          sfslack_spin_frames, SPIN_UNIQUE_THRESH, PCWIN);
+		$display("  frames saturated (BUSY):    %0d  (> %0d distinct PCs)",
+		          sfslack_busy_frames, SPIN_UNIQUE_THRESH);
+		$display("  unique-PC range observed:   min=%0d max=%0d (of %0d-entry window)",
+		          sfslack_min_unique, sfslack_max_unique, PCWIN);
+		$display("  Compare against the MASTER PER-FRAME SLACK SUMMARY above: if the slave shows");
+		$display("  saturated/no-slack frames where the master shows slack, the slave (drawing");
+		$display("  CPU) rather than master-side SDRAM throughput is the better lead for any");
+		$display("  reported slowdown.");
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; sfslack_report(); end
+
+//======================================================================
+// MASTER PC time-weighted histogram (2026-07-25) -- "where does the master
+// actually spend its cycles." fslack_* answers "does the master reach a
+// wait loop before VBlank"; this answers "if it's not stalled on SDRAM and
+// not obviously spinning, what IS it doing" -- specifically, whether cycles
+// are concentrating on one or two addresses, which is the signature of
+// polling a slow handshake partner (the VRAM mailbox, or indirectly the
+// slave/sound board) rather than doing real work. Counts EVERY CE_6M tick
+// (stalled or not) against the master's last-fetched PC, over the same
+// armed window as the stall census.
+//======================================================================
+reg [31:0] pc_tick_hist [0:65535];
+integer    pc_tick_total;
+
+initial begin : pc_tick_hist_init
+	integer i;
+	for (i = 0; i < 65536; i = i + 1) pc_tick_hist[i] = 0;
+	pc_tick_total = 0;
+end
+
+always @(posedge clk_sys) begin
+	if (stall_census_arm && dut.CE_6M) begin
+		pc_tick_hist[master_dbg_pc] <= pc_tick_hist[master_dbg_pc] + 1;
+		pc_tick_total <= pc_tick_total + 1;
+	end
+end
+
+reg pc_tick_taken [0:65535]; // "already reported in this histogram dump" mask, global to avoid a
+                              // 256KB automatic-task stack allocation
+
+task automatic pc_tick_report;
+	integer i, k, best_pc, best_cnt;
+	begin
+		for (i = 0; i < 65536; i = i + 1) pc_tick_taken[i] = 0;
+		$display("==============================================================================");
+		$display("MASTER PC TIME HISTOGRAM (top 12 addresses by CE_6M ticks spent there)");
+		$display("  total ticks counted: %0d", pc_tick_total);
+		for (k = 0; k < 12; k = k + 1) begin
+			best_pc = -1;
+			best_cnt = 0;
+			for (i = 0; i < 65536; i = i + 1) begin
+				if (!pc_tick_taken[i] && pc_tick_hist[i] > best_cnt) begin
+					best_cnt = pc_tick_hist[i];
+					best_pc  = i;
+				end
+			end
+			if (best_pc >= 0) begin
+				pc_tick_taken[best_pc] = 1;
+				$display("  #%0d  pc=0x%04x  ticks=%0d  (%.3f%% of counted ticks)",
+				          k+1, best_pc, best_cnt,
+				          pc_tick_total ? (100.0*best_cnt/pc_tick_total) : 0.0);
+			end
+		end
+		$display("  A small number of addresses dominating this list (esp. >10-20%% each) means");
+		$display("  the master is spending real time revisiting those PCs -- likely a poll loop.");
+		$display("  Cross-reference against known I/O poll addresses (e.g. the mvram mailbox at");
+		$display("  offset 6, port $06) and against SLAVE_FRAME_SLACK above: a busy slave lining");
+		$display("  up with a dominant master poll PC would point at the handshake, not SDRAM.");
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; pc_tick_report(); end
+
+//======================================================================
+// MASTER ROM-stall WAIT-LENGTH histogram (2026-07-25) -- averages hide
+// bimodal behaviour. The master stall census gives one aggregate percentage;
+// this buckets each individual (rom_req & rom_stall) episode by how many
+// consecutive CE_6M ticks it lasted. Directly targets the still-unexplained
+// period-2 stall-percentage alternation found in the first per-frame-slack
+// run (frames alternating ~0.3% <-> ~10%+): if that's driven by two distinct
+// latency classes (e.g. page-hit-ish short waits vs row-miss/refresh-
+// collision long waits) recurring on alternating frames, this histogram
+// should come back visibly bimodal rather than smoothly distributed.
+//======================================================================
+integer wlen_run;                 // ticks the CURRENT stall episode has lasted, 0 = not stalled
+integer wlen_hist [0:8];          // buckets: [0]=1 [1]=2 [2]=3 [3]=4-7 [4]=8-15 [5]=16-31 [6]=32-63 [7]=64-127 [8]=128+
+integer wlen_episodes;
+integer wlen_sum;                 // for a cheap average cross-check against the % stat
+
+initial begin : wlen_init
+	integer i;
+	for (i = 0; i < 9; i = i + 1) wlen_hist[i] = 0;
+	wlen_run      = 0;
+	wlen_episodes = 0;
+	wlen_sum      = 0;
+end
+
+function automatic integer wlen_bucket(input integer len);
+	begin
+		if      (len <= 1)  wlen_bucket = 0;
+		else if (len == 2)  wlen_bucket = 1;
+		else if (len == 3)  wlen_bucket = 2;
+		else if (len <= 7)  wlen_bucket = 3;
+		else if (len <= 15) wlen_bucket = 4;
+		else if (len <= 31) wlen_bucket = 5;
+		else if (len <= 63) wlen_bucket = 6;
+		else if (len <= 127) wlen_bucket = 7;
+		else                 wlen_bucket = 8;
+	end
+endfunction
+
+wire [3:0] wlen_bucket_now = wlen_bucket(wlen_run);
+
+always @(posedge clk_sys) begin
+	if (stall_census_arm && dut.CE_6M) begin
+		if (dut.master.rom_req && dut.master.rom_stall) begin
+			wlen_run <= wlen_run + 1;
+		end else if (wlen_run > 0) begin
+			wlen_hist[wlen_bucket_now] <= wlen_hist[wlen_bucket_now] + 1;
+			wlen_episodes <= wlen_episodes + 1;
+			wlen_sum      <= wlen_sum + wlen_run;
+			wlen_run      <= 0;
+		end
+	end
+end
+
+task automatic wlen_report;
+	begin
+		$display("==============================================================================");
+		$display("MASTER ROM-STALL WAIT-LENGTH HISTOGRAM (per contiguous stall episode, CE_6M ticks)");
+		$display("  episodes:  %0d   sum=%0d ticks   avg=%.2f ticks/episode",
+		          wlen_episodes, wlen_sum, wlen_episodes ? (1.0*wlen_sum/wlen_episodes) : 0.0);
+		$display("  1 tick:    %0d", wlen_hist[0]);
+		$display("  2 ticks:   %0d", wlen_hist[1]);
+		$display("  3 ticks:   %0d", wlen_hist[2]);
+		$display("  4-7:       %0d", wlen_hist[3]);
+		$display("  8-15:      %0d", wlen_hist[4]);
+		$display("  16-31:     %0d", wlen_hist[5]);
+		$display("  32-63:     %0d", wlen_hist[6]);
+		$display("  64-127:    %0d", wlen_hist[7]);
+		$display("  128+:      %0d", wlen_hist[8]);
+		$display("  A smooth decay favors one contention mechanism; two separated humps (e.g. a");
+		$display("  short-wait peak AND a long-wait peak, few episodes between) favors two distinct");
+		$display("  latency classes -- worth matching against the period-2 stall%% alternation.");
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; wlen_report(); end
+
+//======================================================================
+// $E127/$E128/$E957 write trace (2026-07-25) -- chasing the ~51%-of-cycles
+// wait loop at 0xc6fc found by the PC-time histogram. MAME disassembly
+// (real ROM, hand-decoded) showed the loop's PREAMBLE is actually:
+//   LD HL,(0xE127) / XOR A / SBC HL,BC / LD (0xE127),HL / EI / LD BC,0x240F
+// -- and Z80's LD (nn),HL stores LOW byte at nn, HIGH byte at nn+1, so this
+// instruction writes E127 (low) AND E128 (high) TOGETHER as one 16-bit
+// store. The loop body then does LD A,(0xE128); OR A; RET P -- i.e. it is
+// testing the SIGN of a 16-bit SIGNED counter at E127(lo)/E128(hi), not an
+// independent boolean flag. Combined with a caller (0xc3e0) that does
+// LD BC,0x0001 before calling this routine, the working theory is: this is
+// a shared countdown counter, decremented by BC each call, and something
+// ELSE (very likely the periodic scanline/vblank interrupt handler)
+// decrements/updates it independently until it goes negative. If that is
+// right, this loop may be a SOFTWARE PACING primitive ("wait for N
+// interrupts") rather than a hardware/VRAM-mailbox handshake wait -- and if
+// the interrupt handler that drives it is itself delayed by SDRAM stalls
+// elsewhere, this loop's spin count would be an INDIRECT symptom of that,
+// not a cost of its own. MAME's own scheduling (Lua write-tap trace) showed
+// the counter resolving in ~1-2 iterations, but MAME does not need to
+// reproduce real inter-CPU/interrupt contention timing, so that number is
+// not trustworthy for OUR core -- this is what this trace is for.
+//
+// Traces every MASTER write to WRAM offsets 0x127, 0x128 (the counter) and
+// 0x957 (the caller's own invocation counter, from the 0xc3e0 routine) with
+// a timestamp and PC, plus reuses the existing periodic_int_n edge tracking
+// pattern (see INTDBG elsewhere in this file) so interrupt cadence can be
+// cross-referenced against counter updates without new instrumentation for
+// that part. Gated on stall_census_arm like the other post-boot censuses.
+//======================================================================
+reg e957trace_int_d;
+initial e957trace_int_d = 1'b1;
+
+always @(posedge clk_sys) begin
+	if (stall_census_arm && dut.master.CE_6M && dut.wram_we_m &&
+	    (dut.wram_addr_m == 12'h127 || dut.wram_addr_m == 12'h128 || dut.wram_addr_m == 12'h957)) begin
+		$display("t=%0t E12X_WR tick=%0d addr=0x%03x data=0x%02x pc=0x%04x",
+		          $time, stall_ce_total, dut.wram_addr_m, dut.wram_din_m, master_dbg_pc);
+	end
+	e957trace_int_d <= dut.master.periodic_int_n;
+	if (stall_census_arm && dut.master.periodic_int_n != e957trace_int_d)
+		$display("t=%0t E12X_INT tick=%0d periodic_int_n %b->%b",
+		          $time, stall_ce_total, e957trace_int_d, dut.master.periodic_int_n);
+end
+
+//======================================================================
+// Background tile-row FIFO underrun census (2026-07-24)
+//
+// Unlike the CPU, the video path CANNOT stall -- pixel timing is fixed,
+// so when sor_video's tile-row ring buffer is empty at a pop deadline it
+// falls back to HOLDING THE PREVIOUS TILE (sor_video.sv ~line 690). That
+// is a stale-pixel failure mode: a starved fetch shows up on screen as
+// repeated/leftover tile content, not as a slowdown.
+//
+// This is the measurement for two open symptoms at once:
+//   - the flickering artifact near the bottom-left of the pigout screen
+//     (stale held tiles would look exactly like that), and
+//   - pigout "feeling slower" -- rd2 gfx pressure and the master Z80's
+//     rd0 ROM reads share one SDRAM arbiter, so a game with much more
+//     on-screen movement can starve the video path AND buy the CPU extra
+//     wait states from the same root cause.
+//
+// rbuf_min tracks the low-water mark: a healthy margin means the deep
+// lookahead is doing its job, a value pinned at 0 means we are riding the
+// underrun boundary continuously.
+//======================================================================
+integer gfx_pop_total;   // tile-row pop deadlines reached
+integer gfx_underrun;    // ...of which found the ring buffer empty
+integer gfx_rbuf_min;    // low-water mark of rbuf_count at pop time
+integer gfx_underrun_ln; // distinct scanlines on which >=1 underrun happened
+reg     gfx_ln_counted;
+integer gfx_ur_by_vc   [0:255]; // underruns per scanline (clustering test)
+integer gfx_ur_first_hc[0:255]; // hc of the first underrun seen on that line
+integer gfx_vc_i;
+
+initial begin
+	gfx_pop_total   = 0;
+	gfx_underrun    = 0;
+	gfx_rbuf_min    = 99;
+	gfx_underrun_ln = 0;
+	gfx_ln_counted  = 0;
+	for (gfx_vc_i = 0; gfx_vc_i < 256; gfx_vc_i = gfx_vc_i + 1) begin
+		gfx_ur_by_vc[gfx_vc_i]    = 0;
+		gfx_ur_first_hc[gfx_vc_i] = 0;
+	end
+end
+
+always @(posedge clk_sys) begin
+	if (stall_census_arm) begin
+		// new scanline clears the per-line "already counted" flag
+		if (dut.video.ce_pix && dut.video.hc == 10'd0) gfx_ln_counted <= 1'b0;
+
+		if (dut.video.fifo_pop_req) begin
+			gfx_pop_total <= gfx_pop_total + 1;
+			if (dut.video.rbuf_count < gfx_rbuf_min)
+				gfx_rbuf_min <= dut.video.rbuf_count;
+			if (!dut.video.rbuf_has_data) begin
+				gfx_underrun <= gfx_underrun + 1;
+				if (!gfx_ln_counted) begin
+					gfx_underrun_ln <= gfx_underrun_ln + 1;
+					gfx_ln_counted  <= 1'b1;
+				end
+				// Per-scanline histogram + the hc of the first underrun on each
+				// line. Hardware screenshots (2026-07-24) show the pigout
+				// artifact as a ONE-SCANLINE-TALL horizontal run at the LEFT
+				// edge, at a fixed vertical position just above the HUD --
+				// which predicts underruns CLUSTERED at one vc with small hc,
+				// not scattered. If this histogram comes back spread evenly
+				// across vc, the stale-hold explanation is wrong and the
+				// artifact is something else (palette/compositing).
+				if (dut.video.vc < 9'd256) begin
+					gfx_ur_by_vc[dut.video.vc] <= gfx_ur_by_vc[dut.video.vc] + 1;
+					if (!gfx_ln_counted && gfx_ur_first_hc[dut.video.vc] == 0)
+						gfx_ur_first_hc[dut.video.vc] <= dut.video.hc;
+				end
+			end
+		end
+	end
+end
+
+task automatic gfx_underrun_report;
+	real    frac;
+	integer ur_i;
+	begin
+		frac = gfx_pop_total ? (1.0 * gfx_underrun / gfx_pop_total) : 0.0;
+		$display("==============================================================================");
+		$display("BACKGROUND TILE-ROW FIFO UNDERRUN CENSUS");
+		$display("  tile-row pop deadlines:    %0d", gfx_pop_total);
+		$display("  underruns (held stale):    %0d  (%.4f%% of pops)", gfx_underrun, 100.0*frac);
+		$display("  scanlines with >=1:        %0d", gfx_underrun_ln);
+		$display("  rbuf_count low-water mark: %0d  (0 = riding the underrun boundary)", gfx_rbuf_min);
+		$display("  Any nonzero underrun count is a visible stale-tile artifact. Compare");
+		$display("  offroad vs pigout: an underrun count that is ~0 for offroad but nonzero");
+		$display("  for pigout points at rd2 gfx-fetch starvation under pigout's heavier");
+		$display("  on-screen movement as the shared root cause of BOTH open symptoms.");
+		$display("  --- per-scanline distribution (only lines with >=1 underrun) ---");
+		for (ur_i = 0; ur_i < 256; ur_i = ur_i + 1)
+			if (gfx_ur_by_vc[ur_i] != 0)
+				$display("    vc=%0d  underruns=%0d  first_hc=%0d",
+				         ur_i, gfx_ur_by_vc[ur_i], gfx_ur_first_hc[ur_i]);
+		$display("  Clustered at one or two vc values with small first_hc => consistent with");
+		$display("  the observed 1-scanline-tall left-edge artifact. Spread evenly across vc");
+		$display("  => the stale-hold explanation is WRONG, look elsewhere.");
+		$display("==============================================================================");
+	end
+endtask
+initial begin #REPORT_AT_NS; gfx_underrun_report(); end
+
 initial begin
 	sdram_init = 1;
 	reset      = 1;
@@ -2533,103 +3457,180 @@ initial begin
 	sdram_init = 0;
 	repeat (5) @(posedge clk_sys);
 
+`ifdef PIGOUT_ROMS
+	//==================================================================
+	// pigout.zip load map -- transcribed 1:1 from mra/PigOut.mra's
+	// index="0" part list (the shipping, hardware-confirmed layout), with
+	// each MRA <part>/<part repeat>/<interleave> becoming the equivalent
+	// ioctl_load_file/ioctl_fill_zero/ioctl_load_pair call at the same
+	// running stream offset. Enable with +define+PIGOUT_ROMS.
+	//
+	// ROMs are read from ../roms_src/pigout/ (sim/ holds offroad's set).
+	//==================================================================
+	$display("=== Loading full flat ROM image (one ioctl session, pigout.zip) ===");
+	ioctl_index    = 16'h00;
+	ioctl_download = 1'b1;
+
+	// Header: magic 'L', version 1, board_class=GEN3_LELANDI(3),
+	// game_id=GAME_PIGOUT(2), input_scheme=JOY4_DIGITAL(1),
+	// flags=0x10 (FLAG_IN4_PORT -- fixed IN4 @ raw 0x7F, single I/O
+	// window). Byte-for-byte the <part> on mra/PigOut.mra line 11.
+	$display("t=%0t  Header (pigout)...", $time);
+	ioctl_load_bytes('{8'h4C, 8'h01, 8'h03, 8'h02, 8'h01, 8'h10, 8'h00, 8'h00,
+	                   8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00}, 27'h000000);
+
+	// ── Master Z80 ROM: 3 x 64 KB, then 0xD0000 fill to 0x100000 ──
+	$display("t=%0t  Master ROM...", $time);
+	ioctl_load_file("../roms_src/pigout/03-29020-0x.u58t", HDR_LEN + 27'h000000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29021-0x.u59t", HDR_LEN + 27'h010000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29019-01.u57t", HDR_LEN + 27'h020000, 65536);
+
+	// ── Slave Z80 ROM @ ADDR_SLAVE_BASE. NOTE the 0xE000 gap (not
+	// offroad's 0x2E000) -- MAME's real ROM_START(pigout) puts the banked
+	// files at region-relative 0x10000. This is the hardware-confirmed
+	// WP-L3 gap fix; getting it wrong shifts every bank_reg-selected
+	// slave file by +0x20000 and corrupts all graphics.
+	$display("t=%0t  Slave ROM...", $time);
+	ioctl_load_file("../roms_src/pigout/03-29000-01.u3",   HDR_LEN + 27'h100000, 8192);
+	ioctl_fill_zero(                                       HDR_LEN + 27'h102000, 57344);   // 0xE000 fill
+	ioctl_load_file("../roms_src/pigout/03-29001-01.u2t",  HDR_LEN + 27'h110000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29002-01.u3t",  HDR_LEN + 27'h120000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29003-01.u4t",  HDR_LEN + 27'h130000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29004-01.u5t",  HDR_LEN + 27'h140000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29005-01.u6t",  HDR_LEN + 27'h150000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29006-01.u7t",  HDR_LEN + 27'h160000, 65536);
+	ioctl_load_file("../roms_src/pigout/03-29007-01.u8t",  HDR_LEN + 27'h170000, 65536);
+
+	// ── Sound ROM @ ADDR_SOUND_BASE: same 3 interleaved lo/hi pairs at
+	// the same 80186-space offsets (0x40000/0x60000/0xE0000) as offroad.
+	$display("t=%0t  Sound ROM...", $time);
+	ioctl_load_pair("../roms_src/pigout/03-29022-01.u13t", "../roms_src/pigout/03-29025-01.u25t", HDR_LEN + 27'h300000 + 27'h040000);
+	ioctl_load_pair("../roms_src/pigout/03-29023-01.u14t", "../roms_src/pigout/03-29026-01.u26t", HDR_LEN + 27'h300000 + 27'h060000);
+	ioctl_load_pair("../roms_src/pigout/03-29024-01.u15t", "../roms_src/pigout/03-29027-01.u27t", HDR_LEN + 27'h300000 + 27'h0E0000);
+
+	// ── GFX tile ROM @ ADDR_GFX_BASE: 3 x 32 KB, same as offroad ──
+	$display("t=%0t  GFX tile ROM...", $time);
+	ioctl_load_file("../roms_src/pigout/03-29016-01.u93",  HDR_LEN + 27'h400000, 32768);
+	ioctl_load_file("../roms_src/pigout/03-29017-01.u94",  HDR_LEN + 27'h408000, 32768);
+	ioctl_load_file("../roms_src/pigout/03-29018-01.u95",  HDR_LEN + 27'h410000, 32768);
+
+	// ── BG palette PROM @ ADDR_PROM_BASE: pigout populates ALL EIGHT
+	// 16 KB sockets (offroad leaves 4 of the 8 empty), so there is no
+	// zero fill interleaved here. The fetched address span is identical
+	// either way -- only the content differs.
+	$display("t=%0t  Palette PROM...", $time);
+	ioctl_load_file("../roms_src/pigout/03-29011-01.u70",  HDR_LEN + 27'h600000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29015-01.u92",  HDR_LEN + 27'h604000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29010-01.u69",  HDR_LEN + 27'h608000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29014-01.u91",  HDR_LEN + 27'h60C000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29009-01.u68",  HDR_LEN + 27'h610000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29013-01.u90",  HDR_LEN + 27'h614000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29008-01.u67",  HDR_LEN + 27'h618000, 16384);
+	ioctl_load_file("../roms_src/pigout/03-29012-01.u89",  HDR_LEN + 27'h61C000, 16384);
+
+	// ── EEPROM default image @ ADDR_EEPROM_BASE ──
+	$display("t=%0t  EEPROM image...", $time);
+	ioctl_load_file("../roms_src/pigout/eeprom-pigout.bin", HDR_LEN + 27'h700000, 128);
+
+	ioctl_download = 1'b0;
+`else
 	$display("=== Loading full flat ROM image (one ioctl session, offroad.zip) ===");
 	ioctl_index    = 16'h00;
 	ioctl_download = 1'b1;
 
+	// ── 16-byte board-ID header (WP-L1, rtl/leland_board_pkg.sv) ────
+	// magic 'L', version 1, board_class=GEN3_LELANDI(3), game_id=0,
+	// input_scheme=WHEELS3_PEDALS3(0), flags=0x01 (dual I/O window),
+	// 10 reserved bytes. All following addresses are SDRAM addresses
+	// (i.e. HDR_LEN=16 has already been subtracted) -- ioctl_load_file
+	// et al add the header's 16 bytes back on internally via the
+	// HDR_LEN offset baked into ioctl_addr below.
+	$display("t=%0t  Header...", $time);
+	ioctl_load_bytes('{8'h4C, 8'h01, 8'h03, 8'h00, 8'h00, 8'h01, 8'h00, 8'h00,
+	                   8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00}, 27'h000000);
+
 	// ── Master Z80 ROM: 0x000000-0x03FFFF (4 x 64 KB) ──────────────
 	$display("t=%0t  Master ROM...", $time);
-	ioctl_load_file("03-22121-04.u58t", 27'h000000, 65536);
-	ioctl_load_file("03-22122-03.u59t", 27'h010000, 65536);
-	ioctl_load_file("03-22120-01.u57t", 27'h020000, 65536);
-	ioctl_load_file("03-22119-02.u56t", 27'h030000, 65536);
+	ioctl_load_file("03-22121-04.u58t", HDR_LEN + 27'h000000, 65536);
+	ioctl_load_file("03-22122-03.u59t", HDR_LEN + 27'h010000, 65536);
+	ioctl_load_file("03-22120-01.u57t", HDR_LEN + 27'h020000, 65536);
+	ioctl_load_file("03-22119-02.u56t", HDR_LEN + 27'h030000, 65536);
 
-	// ── Slave Z80 ROM: 0x040000-0x0BFFFF ────────────────────────────
+	// ── Slave Z80 ROM: 0x100000-0x17FFFF (leland_board_pkg::ADDR_SLAVE_BASE) ──
 	$display("t=%0t  Slave ROM...", $time);
-	ioctl_load_file("03-22100-02.u3",   27'h040000, 8192);
-	ioctl_fill_zero(                    27'h042000, 184320);  // 0x2E000 fill
-	ioctl_load_file("03-22108-02.u4t",  27'h070000, 65536);
-	ioctl_load_file("03-22109-02.u5t",  27'h080000, 65536);
-	ioctl_load_file("03-22110-02.u6t",  27'h090000, 65536);
-	ioctl_load_file("03-22111-01.u7t",  27'h0A0000, 65536);
-	ioctl_load_file("03-22112-01.u8t",  27'h0B0000, 65536);
+	ioctl_load_file("03-22100-02.u3",   HDR_LEN + 27'h100000, 8192);
+	ioctl_fill_zero(                    HDR_LEN + 27'h102000, 184320);  // 0x2E000 fill
+	ioctl_load_file("03-22108-02.u4t",  HDR_LEN + 27'h130000, 65536);
+	ioctl_load_file("03-22109-02.u5t",  HDR_LEN + 27'h140000, 65536);
+	ioctl_load_file("03-22110-02.u6t",  HDR_LEN + 27'h150000, 65536);
+	ioctl_load_file("03-22111-01.u7t",  HDR_LEN + 27'h160000, 65536);
+	ioctl_load_file("03-22112-01.u8t",  HDR_LEN + 27'h170000, 65536);
 
-	// ── Sound ROM: 0x0C0000-0x1BFFFF (80186's own 0x00000-0xFFFFF
-	// address space, offset by ADDR_SOUND_LO=0x0C0000 -- matches
-	// sdram_rd3_addr's own base in rtl/sor_board.sv) ────────────────
-	// Real bytes now actually reach SDRAM: rtl/sor_board.sv's
-	// ioctl_wr_rom gate used to stop at ADDR_SOUND_LO (pre-WP10, when
-	// this region was still an unemulated dropped fill) -- widened this
-	// session to ADDR_GFX_LO, see that file's own comment. Same 3
+	// ── Sound ROM: 0x300000-0x3FFFFF (80186's own 0x00000-0xFFFFF
+	// address space, offset by leland_board_pkg::ADDR_SOUND_BASE --
+	// matches sdram_rd3_addr's own base in rtl/sor_board.sv). Same 3
 	// interleaved lo/hi pairs, same base offsets within the 80186's own
 	// space, as mra/SuperOffRoad.mra and sim/sor_sound_tb.sv's own
 	// load_pair.
 	$display("t=%0t  Sound ROM...", $time);
-	ioctl_load_pair("03-22113-03.u13t", "03-22116-03.u25t", 27'h0C0000 + 27'h040000);
-	ioctl_load_pair("03-22114-03.u14t", "03-22117-03.u26t", 27'h0C0000 + 27'h060000);
-	ioctl_load_pair("03-22115-03.u15t", "03-22118-03.u27t", 27'h0C0000 + 27'h0E0000);
+	ioctl_load_pair("03-22113-03.u13t", "03-22116-03.u25t", HDR_LEN + 27'h300000 + 27'h040000);
+	ioctl_load_pair("03-22114-03.u14t", "03-22117-03.u26t", HDR_LEN + 27'h300000 + 27'h060000);
+	ioctl_load_pair("03-22115-03.u15t", "03-22118-03.u27t", HDR_LEN + 27'h300000 + 27'h0E0000);
 
-	// ── GFX tile ROM: 0x1C0000-0x1D7FFF (3 x 32 KB) ────────────────
+	// ── GFX tile ROM: 0x400000-0x417FFF (leland_board_pkg::ADDR_GFX_BASE) ──
 	$display("t=%0t  GFX tile ROM...", $time);
-	ioctl_load_file("03-22105-02.u93",  27'h1C0000, 32768);
-	ioctl_load_file("03-22106-02.u94",  27'h1C8000, 32768);
-	ioctl_load_file("03-22107-02.u95",  27'h1D0000, 32768);
+	ioctl_load_file("03-22105-02.u93",  HDR_LEN + 27'h400000, 32768);
+	ioctl_load_file("03-22106-02.u94",  HDR_LEN + 27'h408000, 32768);
+	ioctl_load_file("03-22107-02.u95",  HDR_LEN + 27'h410000, 32768);
 
-	// ── BG palette PROM: 0x1D8000-0x1F7FFF (4 x 16KB + fills) ──────
+	// ── BG palette PROM: 0x600000-0x61FFFF (leland_board_pkg::ADDR_PROM_BASE) ──
 	$display("t=%0t  Palette PROM...", $time);
-	ioctl_fill_zero(                    27'h1D8000, 16384);   // u70 empty
-	ioctl_load_file("03-22104-01.u92",  27'h1DC000, 16384);
-	ioctl_load_file("03-22102-01.u69",  27'h1E0000, 16384);
-	ioctl_fill_zero(                    27'h1E4000, 32768);   // u91+u68 empty
-	ioctl_load_file("03-22103-02.u90",  27'h1EC000, 16384);
-	ioctl_load_file("03-22101-02.u67",  27'h1F0000, 16384);
-	ioctl_fill_zero(                    27'h1F4000, 16384);   // u89 empty
+	ioctl_fill_zero(                    HDR_LEN + 27'h600000, 16384);   // u70 empty
+	ioctl_load_file("03-22104-01.u92",  HDR_LEN + 27'h604000, 16384);
+	ioctl_load_file("03-22102-01.u69",  HDR_LEN + 27'h608000, 16384);
+	ioctl_fill_zero(                    HDR_LEN + 27'h60C000, 32768);   // u91+u68 empty
+	ioctl_load_file("03-22103-02.u90",  HDR_LEN + 27'h614000, 16384);
+	ioctl_load_file("03-22101-02.u67",  HDR_LEN + 27'h618000, 16384);
+	ioctl_fill_zero(                    HDR_LEN + 27'h61C000, 16384);   // u89 empty
 
 	ioctl_download = 1'b0;
+`endif // PIGOUT_ROMS
 
-	// GFX/PROM BRAM real-ioctl-path loading check (2026-07-12 session):
-	// verifies gfx_rom/prom_rom content immediately after the SAME real
-	// ioctl_wr/ioctl_addr_d1 path every other test uses -- unlike
-	// sim/sor_video_tb.sv, which loads ROM files directly via $fread,
-	// bypassing ioctl entirely. Expected values computed directly from
-	// the real ROM chip files in sim/ (first byte of each):
-	//   gfx_rom[0]      (u93) expect 00      prom_rom[0x04000] (u92) expect 00
-	//   gfx_rom[0x8000] (u94) expect ff      prom_rom[0x08000] (u69) expect 69
-	//   gfx_rom[0x10000](u95) expect ff      prom_rom[0x14000] (u90) expect 00
-	//                                        prom_rom[0x18000] (u67) expect 60
-	$display("=== GFX/PROM BRAM real-ioctl-load check ===");
-	$display("gfx_rom[0]=%02x (u93, expect 00)  gfx_rom[0x8000]=%02x (u94, expect ff)  gfx_rom[0x10000]=%02x (u95, expect ff)",
-	          dut.gfx_rom[17'h0], dut.gfx_rom[17'h8000], dut.gfx_rom[17'h10000]);
-	$display("prom_rom[0x4000]=%02x (u92, expect 00)  prom_rom[0x8000]=%02x (u69, expect 69)  prom_rom[0x14000]=%02x (u90, expect 00)  prom_rom[0x18000]=%02x (u67, expect 60)",
-	          dut.prom_rom[17'h4000], dut.prom_rom[17'h8000], dut.prom_rom[17'h14000], dut.prom_rom[17'h18000]);
-
-	// Download-stream telemetry check (2026-07-13 session): the exact
-	// counters the hardware status row now displays, verified here
-	// against a known-good full-image load so a hardware readout can be
-	// compared against sim ground truth field by field.
-	repeat (4) @(posedge clk_sys); // let the session-end fall-edge latches update
-	$display("=== Download-stream telemetry check ===");
-	$display("max_ioctl_addr[26:12]=%03x (expect 1f7)  gfx_wr_hits=%05x (expect 18000)  prom_wr_hits=%05x (expect 20000)",
-	          dut.dbg_max_ioctl_addr, dut.gfx_wr_hits, dut.prom_wr_hits);
-	$display("dl_sessions=%02x  dl_index_last=%02x (expect 00)  dl_end_addr[26:12]=%03x (expect 1f8)",
-	          dut.dbg_dl_sessions, dut.dbg_dl_index_last, dut.dbg_dl_end_addr);
-	if (dut.dbg_max_ioctl_addr != 15'h01F7 || dut.gfx_wr_hits != 20'h18000 || dut.prom_wr_hits != 20'h20000)
-		$display("*** TELEMETRY MISMATCH -- compare against expected values above ***");
+	// WP-L2: the old GFX/PROM BRAM real-ioctl-path loading check (which
+	// hierarchically read dut.gfx_rom/dut.prom_rom) no longer applies --
+	// those BRAM arrays are gone; gfx/prom content now lands in SDRAM
+	// through the same wfifo->SDRAM-write pipeline as master/slave/sound
+	// (see sor_board.sv's wr_gate_hi/ADDR_PROM_REAL_HI). Content-level
+	// correctness for the gfx/prom fetch path is covered by
+	// sim/sor_video_tb.sv's pixel-diff regression against
+	// sim/bg_reference.py, which exercises the real rd2 SDRAM fetch FSM
+	// end-to-end; this board-level testbench's job is compile/wiring
+	// integration only (CPUs, arbiter plumbing), not gfx/prom content.
+	$display("=== GFX/PROM content check moved to sim/sor_video_tb.sv (WP-L2) ===");
 
 	$display("=== Load complete at t=%0t, dropping reset ===", $time);
 	reset = 1'b0;
 
-	// prom_rom self-test (2026-07-13): runs shortly after loading_done
-	// (DL_SETTLE_CYCLES + a few states). Forced read of prom_rom[0x8000]
-	// expect 69; sentinel write+readback expect pass.
-	fork begin
-		wait (dut.prom_st_done);
-		repeat (2) @(posedge clk_sys);
-		$display("=== prom self-test: pass=%b (expect 1)  fp_forced=%02x (expect 69) ===",
-		          dut.prom_st_pass, dut.prom_fp_forced);
-	end join_none
-
-`ifdef GAMEPLAY_REPRO
+`ifdef RD2_STRESS
+	// Synthetic adversarial rd0/rd1/rd3 traffic run (see the RD2_STRESS
+	// generator processes above) -- let sdram_ready/dl_settled/video_release
+	// genuinely settle first (same real gating every other mode relies on),
+	// then saturate rd0/rd1/rd3 for STRESS_RUN_CYCLES while sor_video's real,
+	// unmodified rd2 fetch FSM runs concurrently, and let the
+	// RD2_DEADLINE_MONITOR (declared earlier in this file) do the actual
+	// measurement over that whole window.
+	wait (dut.video_release);
+	$display("t=%0t === RD2_STRESS: video_release seen, starting synthetic rd0/rd1/rd3 saturation ===", $time);
+	rd2_stress_start = 1'b1;
+	repeat (4_800_000) @(posedge clk_sys); // 100ms @ 48MHz -- several full video frames (~15.2ms/frame)
+	$display("t=%0t === RD2_STRESS run complete ===", $time);
+	release dut.sdram_rd0_req;
+	release dut.sdram_rd0_addr;
+	release dut.sdram_rd1_req;
+	release dut.sdram_rd1_addr;
+	release dut.sdram_rd3_req;
+	release dut.sdram_rd3_addr;
+`elsif GAMEPLAY_REPRO
 	// sor_master's REAL reset input is `reset | ~sdram_ready | ~dl_settled`
 	// (rtl/sor_board.sv:1628), not the testbench's raw `reset` register --
 	// dl_settled only goes true DL_SETTLE_CYCLES after ioctl_download
@@ -2648,7 +3649,7 @@ initial begin
 	$display("=== GAMEPLAY_REPRO: running post-injection, watching for PC=0xBDAB and for a stall ===");
 	repeat (bdab_repro_run_cycles) @(posedge clk_sys);
 	$display("t=%0t === GAMEPLAY_REPRO run complete: bdab_hit_count=%0d master_pc_stall_count=%0d last_master_pc=0x%04x last_slave_pc=0x%04x ===",
-	          $time, bdab_hit_count, master_pc_stall_count, dut.dbg_pc, slave_dbg_pc);
+	          $time, bdab_hit_count, master_pc_stall_count, master_dbg_pc, slave_dbg_pc);
 	$fclose(pc_trace_file_m);
 	$fclose(pc_trace_file_s);
 	$finish;
@@ -2668,53 +3669,41 @@ initial begin
 			// keep bumping this one loop at a time, give it 2s of
 			// headroom to clear this whole class of "unmapped hardware,
 			// designed to time out" loops in one shot.
-			#2_000_000_000; // 2s boot-watchdog
+			#WATCHDOG_NS; // boot-watchdog (scales with RUN_LEN_MS)
 			if (!dut.slave_reset_n)
 				$display("=== WARNING: 2s elapsed and slave_reset_n still LOW -- Master boot code never wrote /MCONT bit0 ===");
 		end
 	join_any
 
-	$display("=== Waiting for sor_board's internal readback scan to finish ===");
-	wait (dut.rd_scan_done);
-	repeat (5) @(posedge clk_sys);
+	if (dut.slave_reset_n) $display("=== PASS ===");
+	else                    $display("=== FAIL ===");
 
-	// Live fetch-mismatch counter sim check (docs/sdram_plan.md Section 2,
-	// B1 pre-build gate): confirm live_poll_cnt visibly spins (liveness)
-	// and live_mm_cnt stays 0 (the ideal-clock sim model has no timing
-	// marginality, so mismatches here would indicate an FSM/addressing
-	// bug, not the hardware phenomenon under investigation).
-	begin
-		reg [3:0] live_poll_start;
-		live_poll_start = dut.live_poll_cnt;
-		repeat (3) @(posedge dut.live_tick);
-		repeat (5) @(posedge clk_sys);
-		$display("live_mm_cnt=0x%02x live_poll_cnt=0x%01x (start=0x%01x)",
-		         dut.live_mm_cnt, dut.live_poll_cnt, live_poll_start);
-		if (dut.live_poll_cnt == live_poll_start)
-			$display("=== LIVE_MM FAIL: live_poll_cnt did not spin ===");
-		else if (dut.live_mm_cnt != 8'h00)
-			$display("=== LIVE_MM FAIL: mismatch count nonzero in ideal-clock sim ===");
-		else
-			$display("=== LIVE_MM PASS ===");
+	// 2026-07-24: the join_any above completes the instant the boot handshake
+	// lands (~158 ms), so on a normal PASS the run heads straight for $finish
+	// and every #REPORT_AT_NS report task is skipped -- which is exactly what
+	// happened on the first Verilator full-board run (PASS + RD0CHK printed,
+	// but none of the stall/underrun censuses). For an investigation run that
+	// needs to reach attract mode (SECONDS of sim time, see RUN_LEN_MS at the
+	// top of this file), keep going instead of exiting at the handshake.
+	// Keys off RUN_LEN_MS so the default 790 ms behavior is bit-identical:
+	// only an explicitly-lengthened run waits here.
+	if (REPORT_AT_NS > 790_000_000) begin
+		$display("=== LONG RUN (RUN_LEN_MS=%0d): continuing past boot handshake to t=%0t so the census reports fire ===",
+		         `RUN_LEN_MS, REPORT_AT_NS);
+		if ($time < REPORT_AT_NS) #(REPORT_AT_NS - $time);
+		$display("=== LONG RUN: reached t=%0t ===", $time);
 	end
-
-	$display("");
-	$display("wr_chk    = 0x%02x", dut.wr_chk);
-	$display("rd_chk    = 0x%02x", dut.rd_chk);
-	$display("wr_chk_q0 = 0x%02x  rd_chk_q0 = 0x%02x  match=%b", dut.wr_chk_q0, dut.rd_chk_q0, dut.dbg_chk_match_q0);
-	$display("wr_chk_q1 = 0x%02x  rd_chk_q1 = 0x%02x  match=%b", dut.wr_chk_q1, dut.rd_chk_q1, dut.dbg_chk_match_q1);
-	$display("wr_chk_q2 = 0x%02x  rd_chk_q2 = 0x%02x  match=%b", dut.wr_chk_q2, dut.rd_chk_q2, dut.dbg_chk_match_q2);
-	$display("wr_chk_q3 = 0x%02x  rd_chk_q3 = 0x%02x  match=%b", dut.wr_chk_q3, dut.rd_chk_q3, dut.dbg_chk_match_q3);
-	$display("overall match (dbg_chk_match) = %b", dut.dbg_chk_match);
-	$display("byte-test: done=%b pass=%b readback=0x%02x", dut.bt_done, dut.bt_pass, dut.bt_readback);
-	$display("");
-
-	if (dut.dbg_chk_match && dut.bt_pass) $display("=== PASS ===");
-	else                                   $display("=== FAIL ===");
 
 	$fclose(pc_trace_file_m);
 	$fclose(pc_trace_file_s);
 `endif
+	// Print the rd2 deadline-monitor summary here too (not just at the
+	// 790ms safety-net checkpoint) -- this join_any commonly $finishes as
+	// soon as the boot handshake completes, well before 790ms, so without
+	// this the summary would never print on a normal PASS run.
+	$display("=== RD2_DEADLINE_SUMMARY (at $finish) missed=%0d max_wait_cycles=%0d budget_cycles=%0d ===",
+	          rd2_missed_deadlines, rd2_max_wait, RD2_DEADLINE_CYCLES);
+	wpm0_report(); // WP-M0: ACTIVATE/READ ratio per bank
 	$fclose(board_pcm_fd);
 	stitch_board_wav();
 	$finish;
@@ -2733,6 +3722,7 @@ end
 //------------------------------------------------------------------
 longint unsigned board_cmd_wr_count = 0;
 longint unsigned board_dac_write_count = 0, board_dac9_write_count = 0;
+`ifndef SIM_NO_SOUND
 always @(posedge clk_sys) begin
 	if (dut.sound_cmd_wr_lo || dut.sound_cmd_wr_hi)
 		board_cmd_wr_count <= board_cmd_wr_count + 1;
@@ -2742,6 +3732,7 @@ always @(posedge clk_sys) begin
 	    dut.sound.board.dac_wr[3] || dut.sound.board.dac_wr[4] || dut.sound.board.dac_wr[5])
 		board_dac_write_count <= board_dac_write_count + 1;
 end
+`endif
 
 // WAV capture of dut.audio_out -- same real-time-accurate decimation
 // convention as sor_sound_tb.sv (48,000,000/44,100 ~= 1088 clk_sys
@@ -2831,23 +3822,10 @@ initial begin
 	// the E900/E901/0x1136 write pattern repeating identically every
 	// ~30ms starting at t=371ms, so 0.8s captures several repeats without
 	// the extra wait.
-	#800_000_000;
+	#RUN_END_NS;
 	$display("=== TIMEOUT: simulation did not finish in time ===");
-	// Follow-up 6: final values of the new slave-side status-row debug
-	// taps -- the exact values the on-hardware status row (sor_video
-	// chars 10-28) would show at this moment, so the sim transcript
-	// corroborates what a hardware photo should read.
-	$display("=== SLAVE_DBG_FINAL s_pc=0x%04x bank_reg=%0x bank_wr_cnt=0x%02x bank_max=%0x vram_wr_cnt=0x%04x banked_read_ever=%0d ===",
-	          dut.slave.dbg_pc, dut.slave.dbg_bank_reg, dut.slave.dbg_bank_wr_cnt,
-	          dut.slave.dbg_bank_max, dut.slave.dbg_vram_wr_cnt, dut.slave.dbg_banked_read_ever);
-	// RUNAWAY_TRAP (2026-07-16): the Master's runaway-PC trap (sor_master.sv).
-	// This run reaches the title screen and the Master is healthy there, so the
-	// EXPECTED result is fired=0 -- a nonzero fired here would mean the 16-NOP
-	// sled threshold false-triggers on legitimate code, which would make the
-	// trap useless on hardware. jump_from/jump_to are live (unfrozen) when
-	// fired=0 and simply show the last control-flow transfer.
-	$display("=== RUNAWAY_TRAP fired=%0d jump_from=0x%04x jump_to=0x%04x (expect fired=0 on a healthy run) ===",
-	          dut.master.dbg_sled_trapped, dut.master.dbg_jump_from, dut.master.dbg_jump_to);
+	$display("=== SLAVE_DBG_FINAL s_pc=0x%04x bank_reg=%0x ===",
+	          slave_dbg_pc, dut.slave.bank_reg);
 	// Follow-up 8: cram_we/mcont_r[1] gate evidence summary + a sample of
 	// the actual fg-indexed (address>=64) Color RAM content at run's end.
 	$display("=== CRAM_WR_SUMMARY attempts=%0d landed=%0d blocked=%0d fg_landed(idx>=64)=%0d ===",
@@ -2991,12 +3969,431 @@ always @(posedge clk_sys) begin
 	    (dut.master.cpu_addr[11:0] == 12'h039) && e039_count < 500) begin
 		if (~dut.master.rd_n) begin
 			e039_count = e039_count + 1;
-			$display("t=%0t E039_RD data=0x%02x pc=0x%04x", $time, dut.wram_dout_m, dut.dbg_pc);
+			$display("t=%0t E039_RD data=0x%02x pc=0x%04x", $time, dut.wram_dout_m, master_dbg_pc);
 		end else if (~dut.master.wr_n) begin
 			e039_count = e039_count + 1;
-			$display("t=%0t E039_WR data=0x%02x pc=0x%04x", $time, dut.wram_din_m, dut.dbg_pc);
+			$display("t=%0t E039_WR data=0x%02x pc=0x%04x", $time, dut.wram_din_m, master_dbg_pc);
 		end
 	end
 end
+
+// ---- Scratch debug: interrupt-storm root cause probe ----
+reg int_dbg_prev_pin;
+integer int_dbg_edge_count = 0;
+integer int_dbg_watch_count = 0;
+reg int_dbg_watching;
+initial begin int_dbg_prev_pin=1; int_dbg_watching=0; end
+always @(posedge clk_sys) begin
+	if (dut.master.periodic_int_n !== int_dbg_prev_pin) begin
+		$display("t=%0t INTDBG periodic_int_n %b->%b raster_line=%0d m1_n=%b iorq_n=%b mreq_n=%b CE_6M=%b halt_n=%b",
+		          $time, int_dbg_prev_pin, dut.master.periodic_int_n, dut.raster_line,
+		          dut.master.m1_n, dut.master.iorq_n, dut.master.mreq_n, dut.CE_6M, dut.master.halt_n);
+		int_dbg_prev_pin = dut.master.periodic_int_n;
+		if (dut.master.periodic_int_n == 1'b0 && dut.raster_line != 8'd0) int_dbg_watching = 1'b1;
+	end
+	if (dut.CE_6M && ~dut.master.iorq_n && ~dut.master.m1_n) begin
+		int_dbg_edge_count = int_dbg_edge_count + 1;
+		if (int_dbg_edge_count <= 200)
+			$display("t=%0t INTDBG_ACK #%0d (real INTA cycle seen)", $time, int_dbg_edge_count);
+	end
+	if (int_dbg_watching && dut.CE_6M) begin
+		int_dbg_watch_count = int_dbg_watch_count + 1;
+		if (int_dbg_watch_count <= 300)
+			$display("t=%0t INTDBG_CE #%0d m1_n=%b iorq_n=%b mreq_n=%b wait_n=%b rom_stall=%b rom_req=%b mem_access=%b PC_addr=0x%04x",
+			          $time, int_dbg_watch_count, dut.master.m1_n, dut.master.iorq_n, dut.master.mreq_n,
+			          dut.master.master_cpu.wait_n, dut.master.rom_stall, dut.master.rom_req,
+			          dut.master.mem_access, dut.master.cpu_addr);
+		if (int_dbg_watch_count == 300) int_dbg_watching = 1'b0;
+	end
+end
+final $display("=== INTDBG_FINAL total_real_inta_cycles=%0d ===", int_dbg_edge_count);
+// ---- end scratch debug ----
+
+// ---- Scratch debug: rd2_urgent / arbiter fairness probe ----
+integer arb_dbg_sel_wr = 0, arb_dbg_sel_rd0 = 0, arb_dbg_sel_rd1 = 0, arb_dbg_sel_rd2 = 0, arb_dbg_sel_rd3 = 0;
+integer arb_dbg_rd2_urgent_grants = 0;
+always @(posedge clk_sys) begin
+	if (dut.sel_wr)  arb_dbg_sel_wr  = arb_dbg_sel_wr  + 1;
+	if (dut.sel_rd0) arb_dbg_sel_rd0 = arb_dbg_sel_rd0 + 1;
+	if (dut.sel_rd1) arb_dbg_sel_rd1 = arb_dbg_sel_rd1 + 1;
+	if (dut.sel_rd2) begin
+		arb_dbg_sel_rd2 = arb_dbg_sel_rd2 + 1;
+		if (dut.rd2_urgent) arb_dbg_rd2_urgent_grants = arb_dbg_rd2_urgent_grants + 1;
+	end
+	if (dut.sel_rd3) arb_dbg_sel_rd3 = arb_dbg_sel_rd3 + 1;
+end
+final $display("=== ARBDBG_FINAL sel_wr=%0d sel_rd0=%0d sel_rd1=%0d sel_rd2=%0d (of which rd2_urgent=%0d) sel_rd3=%0d ===",
+                arb_dbg_sel_wr, arb_dbg_sel_rd0, arb_dbg_sel_rd1, arb_dbg_sel_rd2, arb_dbg_rd2_urgent_grants, arb_dbg_sel_rd3);
+// ---- end scratch debug ----
+
+// ---- Scratch debug: wr channel source probe ----
+integer wr_dbg_repack_wr_count = 0, wr_dbg_ioctl_wr_count = 0;
+reg wr_dbg_repack_done_prev;
+integer wr_dbg_repack_done_time = -1;
+initial wr_dbg_repack_done_prev = 1'b0;
+always @(posedge clk_sys) begin
+	if (dut.sel_wr) begin
+		if (dut.repack_active) wr_dbg_repack_wr_count = wr_dbg_repack_wr_count + 1;
+		else wr_dbg_ioctl_wr_count = wr_dbg_ioctl_wr_count + 1;
+	end
+	if (dut.repack_done !== wr_dbg_repack_done_prev) begin
+		$display("t=%0t WRDBG repack_done %b->%b repack_idx=%0d repack_st=%0d", $time, wr_dbg_repack_done_prev, dut.repack_done, dut.repack_idx, dut.repack_st);
+		wr_dbg_repack_done_prev = dut.repack_done;
+	end
+end
+final $display("=== WRDBG_FINAL repack_wr_count=%0d ioctl_wr_count=%0d final_repack_idx=%0d final_repack_st=%0d final_repack_done=%b final_wr_pending=%b final_wfifo_level=%0d ===",
+                wr_dbg_repack_wr_count, wr_dbg_ioctl_wr_count, dut.repack_idx, dut.repack_st, dut.repack_done, dut.wr_pending, dut.wfifo_level);
+// ---- end scratch debug ----
+
+// ---- Scratch debug: RD0 (master ROM) data-correctness probe (angle A) ----
+// Shadow the 256 KB master ROM region from the same four files the ioctl
+// loader streams into SDRAM, then verify every rd0 read returns the byte
+// on disk. Catches write-path corruption, byte-lane/word packing bugs,
+// and address-mapping mismatches in one shot.
+reg [7:0] rd0_shadow [0:262143];
+integer rd0sf, rd0src;
+reg [63:0] rd0_chk_count, rd0_err_count;
+initial begin
+	rd0_chk_count = 0; rd0_err_count = 0;
+	// The shadow MUST match whichever game's master ROM was actually streamed
+	// into SDRAM. This was offroad-only and unconditional until 2026-07-24,
+	// which made the first pigout run report a spurious
+	// `RD0CHK_FINAL checks=352 errors=317` -- SDRAM held pigout's master ROM
+	// while the shadow held offroad's, so ~90% of comparisons mismatched. That
+	// was a testbench gap, NOT a core bug: do not chase it as one.
+`ifdef PIGOUT_ROMS
+	// pigout: 3 x 64 KB (mra/PigOut.mra lines 13-15); 0x30000-0x3FFFF stays
+	// zero, matching the MRA's 0xD0000 tail fill.
+	rd0sf=$fopen("../roms_src/pigout/03-29020-0x.u58t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h00000, 65536); $fclose(rd0sf);
+	rd0sf=$fopen("../roms_src/pigout/03-29021-0x.u59t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h10000, 65536); $fclose(rd0sf);
+	rd0sf=$fopen("../roms_src/pigout/03-29019-01.u57t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h20000, 65536); $fclose(rd0sf);
+`else
+	rd0sf=$fopen("03-22121-04.u58t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h00000, 65536); $fclose(rd0sf);
+	rd0sf=$fopen("03-22122-03.u59t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h10000, 65536); $fclose(rd0sf);
+	rd0sf=$fopen("03-22120-01.u57t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h20000, 65536); $fclose(rd0sf);
+	rd0sf=$fopen("03-22119-02.u56t","rb"); rd0src=$fread(rd0_shadow, rd0sf, 32'h30000, 65536); $fclose(rd0sf);
+`endif
+	$display("=== RD0CHK shadow loaded (byte0=0x%02x byte0x38=0x%02x) ===", rd0_shadow[0], rd0_shadow[18'h38]);
+end
+// Write-side snoop of bank 0 (master): capture every accepted full-word
+// SDRAM write to bank 0, so we can tell a write-path bug (master ROM never
+// reaches bank 0) from a read-path bug (written, but read returns garbage).
+reg [7:0] wr_shadow0 [0:262143];
+integer wsi, wr0_bytes;
+initial begin for (wsi=0; wsi<262144; wsi=wsi+1) wr_shadow0[wsi]=8'hFF; wr0_bytes=0; end
+always @(posedge clk_sys) begin
+	if (dut.sd_ready && dut.sd_we_word && dut.sd_bank==2'd0) begin
+		wr_shadow0[dut.sd_addr_rel[17:0]]      <= dut.sd_din;
+		wr_shadow0[(dut.sd_addr_rel[17:0])+1]  <= dut.sd_din_hi;
+		wr0_bytes = wr0_bytes + 2;
+	end
+end
+always @(posedge clk_sys) begin
+	if (dut.sdram_rd0_ack) begin
+		rd0_chk_count <= rd0_chk_count + 1;
+		if (dut.sdram_rd0_data !== rd0_shadow[dut.sdram_rd0_addr[17:0]]) begin
+			rd0_err_count <= rd0_err_count + 1;
+			if (rd0_err_count < 20)
+				$display("t=%0t RD0_CORRUPT addr=0x%05x got=0x%02x exp=0x%02x wrsnoop=0x%02x m_pc=0x%04x",
+				          $time, dut.sdram_rd0_addr[17:0], dut.sdram_rd0_data,
+				          rd0_shadow[dut.sdram_rd0_addr[17:0]],
+				          wr_shadow0[dut.sdram_rd0_addr[17:0]], master_dbg_pc);
+		end
+	end
+end
+final begin
+	$display("=== RD0CHK_FINAL checks=%0d errors=%0d ===", rd0_chk_count, rd0_err_count);
+	$display("=== WRSNOOP_FINAL bank0_write_accepts_bytes=%0d wr[0]=0x%02x wr[0x38]=0x%02x wr[0x3777]=0x%02x (rom exp 0xf3/0xc3/0x..) ===",
+	          wr0_bytes, wr_shadow0[0], wr_shadow0[18'h38], wr_shadow0[18'h3777]);
+	// Peek the actual SDRAM chip Bank0 memory (word index = byteaddr>>1).
+	// If these hold real ROM data, the controller WRITE reached the chip and
+	// the fault is on the READ side; if they are 0xXXXX/0xFFFF the write
+	// never landed.
+	$display("=== CHIPPEEK Bank0 word[0x00>>1]=0x%04x word[0x38>>1]=0x%04x word[0x3777>>1]=0x%04x ===",
+	          chip.Bank0[22'h00 >> 1], chip.Bank0[22'h38 >> 1], chip.Bank0[22'h3777 >> 1]);
+	$display("=== CHIPPEEK banks@word0x1c B0=0x%04x B1=0x%04x B2=0x%04x B3=0x%04x ===",
+	          chip.Bank0[22'h1c], chip.Bank1[22'h1c], chip.Bank2[22'h1c], chip.Bank3[22'h1c]);
+	// scan Bank0 for first word matching the master ROM's opening bytes {ED,F3}=0xEDF3
+	begin : scan0
+		integer si; reg found;
+		found = 0;
+		for (si = 0; si < 200000 && !found; si = si + 1)
+			if (chip.Bank0[si] == 16'hEDF3) begin
+				$display("=== SCAN Bank0: 0xEDF3 found at word %0d (byteaddr 0x%05x) ===", si, si*2);
+				found = 1;
+			end
+		if (!found) $display("=== SCAN Bank0: master opening word 0xEDF3 NOT FOUND in first 200000 words ===");
+		// count non-zero words in first 0x20000 (256KB region)
+		begin integer nz; nz=0;
+			for (si=0; si<131072; si=si+1) if (chip.Bank0[si] !== 16'h0000) nz=nz+1;
+			$display("=== SCAN Bank0: nonzero words in first 256KB = %0d ===", nz);
+		end
+	end
+end
+// ---- end scratch debug ----
+
+// ---- STAGE TRACE probe (offset hunt) ----
+integer enq_n=0, deq_n=0, wr_n=0;
+always @(posedge clk_sys) begin
+	// enqueue trace
+	if (dut.ioctl_wr_rom && !dut.wfifo_full && enq_n < 12) begin
+		$display("t=%0t ENQ[%0d] sdram_addr=0x%06x ioctl_data=0x%02x ioctl_addr_d1=0x%06x wptr=%0d",
+		         $time, enq_n, dut.sdram_addr, dut.ioctl_data, dut.ioctl_addr_d1, dut.wfifo_wptr);
+		enq_n = enq_n + 1;
+	end
+	// dequeue trace
+	if (!dut.wr_pending && (dut.wfifo_level >= 2) && !dut.sdram_wr_ack && deq_n < 8) begin
+		$display("t=%0t DEQ[%0d] latched_addr(next)=word rptr=%0d even_addrfield=0x%06x lo=0x%02x hi=0x%02x",
+		         $time, deq_n, dut.wfifo_rptr,
+		         dut.wfifo[dut.wfifo_rptr[4:0]][30:8],
+		         dut.wfifo[dut.wfifo_rptr[4:0]][7:0],
+		         dut.wfifo[dut.wfifo_rptr_p1][7:0]);
+		deq_n = deq_n + 1;
+	end
+	// accepted bank0 write trace
+	if (dut.sd_ready && dut.sd_we_word && dut.sd_bank==2'd0 && wr_n < 8) begin
+		$display("t=%0t WRACC[%0d] sd_addr_rel=0x%06x din=0x%02x din_hi=0x%02x sdram_wr_addr=0x%07x",
+		         $time, wr_n, dut.sd_addr_rel, dut.sd_din, dut.sd_din_hi, dut.sdram_wr_addr);
+		wr_n = wr_n + 1;
+	end
+end
+// ---- end STAGE TRACE ----
+
+// ---- CHIP PIN WRITE probe: decode WRITE cmd at chip pins ----
+integer cpw_n=0;
+wire chip_write_cmd = ~SDRAM_nCS & SDRAM_nRAS & ~SDRAM_nCAS & ~SDRAM_nWE;
+wire chip_act_cmd   = ~SDRAM_nCS & ~SDRAM_nRAS & SDRAM_nCAS & SDRAM_nWE;
+always @(posedge SDRAM_CLK) begin
+	if (chip_act_cmd && SDRAM_BA==2'd0 && cpw_n < 10)
+		$display("t=%0t CHIP ACT bank0 row=0x%04x", $time, SDRAM_A);
+	if (chip_write_cmd && SDRAM_BA==2'd0 && cpw_n < 10) begin
+		$display("t=%0t CHIP WRITE bank0 col(A[8:0])=0x%03x A[10]=%b DQ=0x%04x DQM=%b%b",
+		         $time, SDRAM_A[8:0], SDRAM_A[10], SDRAM_DQ, SDRAM_DQMH, SDRAM_DQML);
+		cpw_n = cpw_n + 1;
+	end
+end
+// ---- end CHIP PIN WRITE probe ----
+
+// ---- controller internal state trace ----
+integer cst_n=0;
+always @(posedge clk_sys) begin
+	if ((dut.sdram_ctrl.state == 9 || dut.sdram_ctrl.state == 7 || dut.sdram_ctrl.cmd_r == 4'h4) && cst_n < 40) begin
+		$display("t=%0t CST state=%0d wait=%0d cmd_r=0x%01x rq_col=0x%03x sd_a=0x%04x sd_dq_out=0x%04x oe=%b",
+		         $time, dut.sdram_ctrl.state, dut.sdram_ctrl.wait_cnt, dut.sdram_ctrl.cmd_r, dut.sdram_ctrl.rq_col,
+		         dut.sd_a, dut.sd_dq_out, dut.sd_dq_oe);
+		cst_n = cst_n + 1;
+	end
+end
+// ---- end controller internal state trace ----
+
+// ---- master Z80 instruction trace (opcode-fetch M1 cycles) ----
+// Logs every M1/MREQ/RD opcode-fetch cycle on the master Z80 (PC + opcode
+// byte). Used to diff execution flow against a known-good build to find
+// the first instruction where behavior diverges (different PC reached,
+// or different opcode byte read at the same PC -> memory corruption).
+integer ztrace_fd;
+reg     ztrace_closed = 0;
+// Trace file-size cutoff. Kept at 1.8 s for ordinary runs, but never allowed to
+// exceed the run itself; on a long RUN_LEN_MS run the trace simply stops at 1.8 s
+// while the simulation continues (see the cutoff logic below).
+localparam time ZTRACE_STOP_NS = 1_800_000_000;
+initial ztrace_fd = $fopen("ztrace_master.log", "w"); // relative to sim CWD (Windows/ModelSim has no /tmp)
+always @(posedge clk_sys) begin
+	if (!ztrace_closed && dut.master.CE_6M && ~dut.master.m1_n && ~dut.master.mreq_n && ~dut.master.rd_n &&
+	    ~((dut.master.rom_req & dut.master.rom_stall) | dut.master.mvport_stall)) begin
+		$fdisplay(ztrace_fd, "%0t PC=%04x OP=%02x", $time, dut.master.cpu_addr, dut.master.cpu_din);
+		// WP-M8 (2026-07-24): bumped from 150ms -- the repack FSM now also
+		// fetches/writes plane2 (see leland_board_pkg.sv's ADDR_GFXROW_BASE),
+		// roughly doubling repack-phase SDRAM transactions and pushing total
+		// boot time (repack + master boot handshake) past this cutoff before
+		// the real PASS milestone (MCONT write releasing slave_reset_n) was
+		// reached -- this is just a debug-trace file-size limit, not a
+		// correctness gate, so widening it is safe.
+		// WP-L3 (2026-07-24): bumped from 300ms -- the new per-game EEPROM
+		// boot-load FSM (sor_board.sv's ee_st) is sequenced after repack_done
+		// and gates video_release/cpu_release the same way repack_done does,
+		// pushing total pre-boot-handshake time out further again. Same
+		// non-correctness rationale as the 150ms->300ms bump above; the real
+		// PASS/FAIL determination has its own independent 2-second
+		// boot-watchdog (see the `fork...join_any` near this file's end) --
+		// this cutoff must stay comfortably under that 2s budget so it never
+		// preempts a genuine PASS, not right at the old boundary.
+		// 2026-07-24: this used to `$finish`, which silently killed the WHOLE
+		// simulation at 1.8 s -- it terminated the first 30 s pigout attract-mode
+		// run (RUN_LEN_MS=30000) at 1.8 s with no censuses printed, even though
+		// the LONG RUN guard was correctly waiting for t=30 s. This is only a
+		// debug-trace FILE SIZE limit, so it now stops TRACING and lets the run
+		// continue. Safe for the default run too: the default ends at 800 ms,
+		// below this cutoff, so it never fired there anyway.
+		if ($time > ZTRACE_STOP_NS && !ztrace_closed) begin
+			$fclose(ztrace_fd);
+			ztrace_closed <= 1'b1;
+			$display("=== ZTRACE DONE at t=%0t (tracing stopped; simulation continues) ===", $time);
+		end
+	end
+end
+// ---- end master Z80 instruction trace ----
+
+// ---- rd0 (master ROM) ack/data probe ----
+integer rd0ack_n = 0;
+always @(posedge clk_sys) begin
+	if (dut.sdram_rd0_req && $time > 100_000_000 && rd0ack_n < 30)
+		$display("t=%0t RD0_REQ addr=0x%06x ready=%b ackhold=%b", $time, dut.sdram_rd0_addr, dut.sdram_ready, dut.rd0_cache.cache_ack_hold);
+	if (dut.sdram_rd0_ack && $time > 100_000_000 && rd0ack_n < 30) begin
+		$display("t=%0t RD0_ACK data=0x%02x", $time, dut.sdram_rd0_data);
+		rd0ack_n = rd0ack_n + 1;
+	end
+end
+// ---- end rd0 probe ----
+
+// ---- chip-model internal DQ probe: does the model itself drive the
+// correct byte onto the pin, or does it stay Z/X at the sample point? ----
+integer chipdq_n = 0;
+always @(posedge SDRAM_CLK) begin
+	if (chip.Data_out_enable && $time > 121_200_000 && $time < 121_260_000 && chipdq_n < 40) begin
+		$display("t=%0t CHIPDQ Dq_reg=%h Data_out_enable=%b Dqm_reg0=%b SDRAM_DQ=%h Bank=%h Row=%h Col=%h",
+		         $time, chip.Dq_reg, chip.Data_out_enable, chip.Dqm_reg0, SDRAM_DQ, chip.Bank, chip.Row, chip.Col);
+		chipdq_n = chipdq_n + 1;
+	end
+end
+// ---- end chip-model internal DQ probe ----
+
+// ---- unbounded watch: track the real open row per bank, and only report
+// activity that genuinely targets bank0/row0/col0 (true byte address 0) --
+// the previous version only checked the column bits and got fooled by
+// every row's own col0 write during the linear 256KB download ----
+reg [12:0] cur_row_b0, cur_row_b1, cur_row_b2, cur_row_b3;
+always @(posedge SDRAM_CLK) begin
+	if (~SDRAM_nCS && ~SDRAM_nRAS && SDRAM_nCAS && SDRAM_nWE) begin
+		// ACTIVE command: SDRAM_A holds the row being opened
+		case (SDRAM_BA)
+			2'd0: cur_row_b0 <= SDRAM_A[12:0];
+			2'd1: cur_row_b1 <= SDRAM_A[12:0];
+			2'd2: cur_row_b2 <= SDRAM_A[12:0];
+			2'd3: cur_row_b3 <= SDRAM_A[12:0];
+		endcase
+		if (SDRAM_BA==2'd0 && SDRAM_A[12:0]==13'h0)
+			$display("t=%0t REALADDR0_ACT bank0 row=0x%04x", $time, SDRAM_A);
+	end
+	if (~SDRAM_nCS && SDRAM_nRAS && ~SDRAM_nCAS && ~SDRAM_nWE &&
+	    SDRAM_BA==2'd0 && cur_row_b0==13'h0 && SDRAM_A[8:0]==9'h000 && SDRAM_A[10]==1'b0) begin
+		$display("t=%0t REALADDR0_WRITE bank0 row0 col0 DQ=0x%04x DQM=%b%b", $time, SDRAM_DQ, SDRAM_DQMH, SDRAM_DQML);
+	end
+end
+// ---- end unbounded real-address-0 watch ----
+
+// ---- raw memory-array peek: chip.Bank0[row0][col0], bypassing all
+// read/write command logic entirely -- watch for the exact moment (if
+// any) the array cell itself changes value ----
+reg [15:0] bank0_00_prev;
+initial bank0_00_prev = 16'h0;
+always @(posedge SDRAM_CLK) begin
+	if (chip.Bank0[13'h0] !== bank0_00_prev) begin
+		$display("t=%0t ARRAYCELL_CHANGE Bank0[0] %h -> %h", $time, bank0_00_prev, chip.Bank0[13'h0]);
+		bank0_00_prev <= chip.Bank0[13'h0];
+	end
+end
+// ---- end raw memory-array peek ----
+
+// ---- dump first 64 words of Bank0 at sim end, to see the corruption
+// pattern (which specific words are missing vs present) ----
+final begin
+	integer wi;
+	for (wi = 0; wi < 64; wi = wi + 1)
+		$display("t=FINAL DUMP word[%0d]=0x%04x", wi, chip.Bank0[wi]);
+end
+// ---- end dump ----
+
+// ---- ack-vs-pin-write correlation: does sdram_wr_ack ever fire without
+// a real WRITE command having reached the chip pins since the last ack?
+// Also watches wfifo_overflow directly. ----
+integer wrack_n = 0, chipwr_n = 0;
+integer wrack_seq = 0, chipwr_seq = 0;
+reg pin_write_seen_since_last_ack;
+initial pin_write_seen_since_last_ack = 1'b0;
+always @(posedge clk_sys) begin
+	if (dut.wfifo_overflow)
+		$display("t=%0t WFIFO_OVERFLOW_FLAG_SET", $time);
+end
+always @(posedge SDRAM_CLK) begin
+	if (SDRAM_nRAS && ~SDRAM_nCAS && ~SDRAM_nWE && ~SDRAM_nCS) begin
+		chipwr_seq = chipwr_seq + 1;
+		pin_write_seen_since_last_ack <= 1'b1;
+	end
+end
+always @(posedge clk_sys) begin
+	if (dut.sdram_wr_ack) begin
+		wrack_seq = wrack_seq + 1;
+		if (wrack_n < 400) begin
+			$display("t=%0t WRACK #%0d pin_write_since_last=%b chipwr_seq=%0d addr=0x%06x",
+			         $time, wrack_seq, pin_write_seen_since_last_ack, chipwr_seq, dut.sdram_wr_addr);
+			wrack_n = wrack_n + 1;
+		end
+		pin_write_seen_since_last_ack <= 1'b0;
+	end
+end
+// ---- end ack-vs-pin-write correlation ----
+
+// ---- Sys_clk/CKE pulse check: does the model's internal Sys_clk actually
+// pulse at every WRITE command edge, or does it silently miss some? ----
+integer syswr_n = 0;
+always @(posedge SDRAM_CLK) begin
+	if (SDRAM_nRAS && ~SDRAM_nCAS && ~SDRAM_nWE && ~SDRAM_nCS && syswr_n < 60) begin
+		$display("t=%0t PINWRITE_CKECHECK Cke=%b chip.CkeZ=%b chip.Sys_clk=%b bank=%0d A=0x%04x",
+		         $time, SDRAM_CKE, chip.CkeZ, chip.Sys_clk, SDRAM_BA, SDRAM_A);
+		syswr_n = syswr_n + 1;
+	end
+end
+// ---- end Sys_clk/CKE pulse check ----
+
+// ---- refresh/precharge-all correlation: log every AUTO_REFRESH and
+// PRECHARGE-ALL command at the pins, plus every ACT to bank0, so the
+// missing-word list can be checked against refresh boundaries ----
+integer refresh_n = 0;
+always @(posedge SDRAM_CLK) begin
+	if (~SDRAM_nCS && ~SDRAM_nRAS && ~SDRAM_nCAS && SDRAM_nWE && refresh_n < 30) begin
+		$display("t=%0t CMD_AUTO_REFRESH #%0d", $time, refresh_n);
+		refresh_n = refresh_n + 1;
+	end
+	if (~SDRAM_nCS && ~SDRAM_nRAS && SDRAM_nCAS && ~SDRAM_nWE && SDRAM_A[10] && refresh_n < 30)
+		$display("t=%0t CMD_PRECHARGE_ALL", $time);
+end
+// ---- end refresh correlation ----
+
+// ---- fine-grained controller-FSM trace around the first RD0_CORRUPT
+// event (t~121256086ns): state, read_capture_sr, in_flight, issued_ch,
+// per-bank row_valid, on every clk_sys cycle in a narrow window ----
+always @(posedge clk_sys) begin
+	if ($time > 121_250_000 && $time < 121_260_000) begin
+		$display("t=%0t FSMTRACE state=%0d wait_cnt=%0d rcs=%h in_flight=%b issued_ch=%0d sd_ready=%b sd_bank=%0d rq_bank=%0d rv=%b%b%b%b sel_wr=%b sel_rd0=%b sel_rd2=%b sdram_rd0_req=%b sdram_rd2_req=%b",
+		         $time, dut.sdram_ctrl.state, dut.sdram_ctrl.wait_cnt, dut.sdram_ctrl.read_capture_sr,
+		         dut.in_flight, dut.issued_ch, dut.sd_ready, dut.sd_bank, dut.sdram_ctrl.rq_bank,
+		         dut.sdram_ctrl.rv3, dut.sdram_ctrl.rv2, dut.sdram_ctrl.rv1, dut.sdram_ctrl.rv0,
+		         dut.sel_wr, dut.sel_rd0, dut.sel_rd2, dut.sdram_rd0_req, dut.sdram_rd2_req);
+	end
+end
+// ---- end fine-grained FSM trace ----
+
+// ---- DQ-bus capture snoop: at the exact cycle read_capture_sr[0] fires
+// (the controller's own capture instant), compare sd_dq_in (what the
+// controller latches) against the raw SDRAM_DQ pin value sampled on the
+// two nearest SDRAM_CLK edges, and the chip model's own Dq_reg/Data_out_
+// enable/Bank/Row/Col at that moment -- to see whether the bus itself
+// disagrees with what gets latched, or the chip is driving something
+// other than what was requested. Window-limited to the corruption run.
+integer dqsnoop_n = 0;
+reg [15:0] sdram_dq_last_sampled;
+always @(posedge SDRAM_CLK) sdram_dq_last_sampled <= SDRAM_DQ;
+
+always @(posedge clk_sys) begin
+	if (dut.sdram_ctrl.read_capture_sr[0] && $time > 121_250_000 && $time < 121_265_000 && dqsnoop_n < 60) begin
+		$display("t=%0t DQSNOOP sd_dq_in=%h SDRAM_DQ_now=%h SDRAM_DQ_lastclk=%h rdata_reg_pre=%h rq_bank=%0d rq_row=%h rq_col=%h chip.Dq_reg=%h chip.Data_out_enable=%b chip.Bank=%0d chip.Row=%h chip.Col=%h",
+		         $time, dut.sd_dq_in, SDRAM_DQ, sdram_dq_last_sampled, dut.sdram_ctrl.rdata_reg,
+		         dut.sdram_ctrl.rq_bank, dut.sdram_ctrl.rq_row, dut.sdram_ctrl.rq_col,
+		         chip.Dq_reg, chip.Data_out_enable, chip.Bank, chip.Row, chip.Col);
+		dqsnoop_n = dqsnoop_n + 1;
+	end
+end
+// ---- end DQ-bus capture snoop ----
 
 endmodule

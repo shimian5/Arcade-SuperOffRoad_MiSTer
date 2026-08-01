@@ -35,6 +35,8 @@
 
 `timescale 1ns / 1ps
 
+import leland_board_pkg::*;
+
 module sor_video_tb;
 
 localparam CLK_PERIOD = 20.83; // 48 MHz
@@ -66,8 +68,17 @@ wire [9:0]  cram_addr;
 wire [7:0]  cram_data = 8'h00; // palette lookup not needed -- probing bg_pen directly
 wire [23:0] rgb;
 
-wire [16:0] gfx_addr, prom_addr;
-reg  [7:0]  gfx_data, prom_data;
+// WP-L2: gfx/prom fetch now goes through an SDRAM-style req/ack
+// handshake (sor_board.sv's rd2 arbiter channel on real hardware).
+// This standalone TB has no arbiter/sdram_simple, so it fakes one
+// directly against the same gfx_rom/prom_rom arrays below, with an
+// artificial multi-cycle latency (matching real sdram_simple's ~5
+// clk_sys cycles) so the fetch FSM's req/ack handshake is genuinely
+// exercised rather than trivially satisfied same-cycle.
+wire        sdram_rd2_req;
+wire [24:0] sdram_rd2_addr;
+reg         sdram_rd2_ack;
+reg   [7:0] sdram_rd2_data;
 
 // 2026-07-14 session: promoted from hardwired literals to regs so a
 // single simulation run can sweep multiple (scroll_x, scroll_y,
@@ -143,9 +154,77 @@ initial begin
 	          gfx_rom[4], gfx_rom[5], gfx_rom[6], gfx_rom[7]);
 end
 
+// Fake SDRAM responder: services sdram_rd2_req/addr against the local
+// gfx_rom/prom_rom arrays (loaded above from the real ROM chip files),
+// with a fixed multi-cycle latency modeling real sdram_simple's ~5
+// clk_sys-cycle address-to-ack window. Address decode mirrors
+// rtl/leland_board_pkg.sv's canonical ADDR_GFX_BASE/ADDR_PROM_BASE.
+localparam RD2_LAT = 4; // ~5 cycles total: 1 (accept) + RD2_LAT wait + ack
+reg        rd2_busy = 1'b0; // sim-only initializer -- an uninitialized reg
+                             // here leaves rd2_busy permanently X (both
+                             // `if(X)`/`if(!X)` evaluate false), the same
+                             // X-stall class this project's ce_z80_cnt/
+                             // pix_acc initializers exist to avoid.
+reg  [3:0] rd2_cnt;
+reg [24:0] rd2_addr_lat;
+reg [15:0] sdram_rd2_data16;
+reg [15:0] sdram_rd2_data16_hi; // WP-M8: second burst word of a GFXROW read
+// Edge-detect the request, not level: sor_video's FSM (like every real
+// SDRAM client in this project, see sor_board.sv's arbiter "duplicate-
+// transaction race" comment) holds sdram_rd2_req_r high through the
+// cycle its ack is registered and only drops it the FOLLOWING cycle --
+// so a naive level check (`!busy && req`) re-accepts that same still-
+// high req one cycle after busy clears, before the client has dropped
+// it, silently re-fetching the byte the FSM already considers done and
+// desynchronizing which ack corresponds to which requested address
+// (caught here: it fed the GFX0 byte back to the FSM's GFX1 register).
+// req_prev/req_rise below is this TB's equivalent of that arbiter's
+// in_flight gate -- only accept on req's rising edge.
+reg req_prev = 1'b0;
+always @(posedge clk_sys) req_prev <= sdram_rd2_req;
+wire req_rise = sdram_rd2_req && !req_prev;
 always @(posedge clk_sys) begin
-	gfx_data  <= gfx_rom[gfx_addr];
-	prom_data <= prom_rom[prom_addr];
+	sdram_rd2_ack <= 1'b0;
+	if (!rd2_busy && req_rise) begin
+		rd2_busy     <= 1'b1;
+		rd2_addr_lat <= sdram_rd2_addr;
+		rd2_cnt      <= RD2_LAT[3:0];
+	end else if (rd2_busy) begin
+		if (rd2_cnt == 4'd0) begin
+			sdram_rd2_data <= (rd2_addr_lat >= ADDR_PROM_BASE[24:0]) ?
+			                      prom_rom[rd2_addr_lat - ADDR_PROM_BASE[24:0]] :
+			                      gfx_rom [rd2_addr_lat - ADDR_GFX_BASE[24:0]];
+			// Wider-reads path (2026-07-22): this standalone TB has no
+			// gfx-repack FSM (that lives in sor_board.sv, exercised by
+			// sor_board_tb.sv's full-board sim instead) -- synthesize the
+			// packed word on the fly from the same flat gfx_rom content
+			// instead, {plane1[i], plane0[i]}, i = word index within
+			// ADDR_GFXW_BASE, matching rtl/sor_board.sv's repack layout
+			// exactly so anything still reading ADDR_GFXW_BASE gets
+			// identical data either way. Nothing in sor_video.sv's live
+			// fetch path reads this range any more as of WP-M8 (superseded
+			// by ADDR_GFXROW_BASE below), kept only in case anything else
+			// ever exercises it directly.
+			if (rd2_addr_lat >= ADDR_GFXW_BASE[24:0] && rd2_addr_lat < ADDR_GFXROW_BASE[24:0]) begin
+				sdram_rd2_data16 <= {gfx_rom[((rd2_addr_lat - ADDR_GFXW_BASE[24:0]) >> 1) + 17'h8000],
+				                     gfx_rom[ (rd2_addr_lat - ADDR_GFXW_BASE[24:0]) >> 1]};
+			end
+			// WP-M8 (2026-07-24): ADDR_GFXROW_BASE packed entry, same
+			// synthesis idea as ADDR_GFXW_BASE above but 4-byte-aligned
+			// (matching rtl/sor_board.sv's repack FSM RP_WR2/RP_WR3
+			// states) -- word0={plane1,plane0} (identical content to
+			// GFXW's entry), word1={8'h00,plane2}. idx = byte offset >> 2.
+			if (rd2_addr_lat >= ADDR_GFXROW_BASE[24:0] && rd2_addr_lat < ADDR_PROM_BASE[24:0]) begin
+				sdram_rd2_data16    <= {gfx_rom[((rd2_addr_lat - ADDR_GFXROW_BASE[24:0]) >> 2) + 17'h8000],
+				                        gfx_rom[ (rd2_addr_lat - ADDR_GFXROW_BASE[24:0]) >> 2]};
+				sdram_rd2_data16_hi <= {8'h00, gfx_rom[((rd2_addr_lat - ADDR_GFXROW_BASE[24:0]) >> 2) + 17'h10000]};
+			end
+			sdram_rd2_ack <= 1'b1;
+			rd2_busy      <= 1'b0;
+		end else begin
+			rd2_cnt <= rd2_cnt - 4'd1;
+		end
+	end
 end
 
 sor_video dut
@@ -164,27 +243,14 @@ sor_video dut
 	.scroll_y(tb_scroll_y),
 	.gfxbank(tb_gfxbank),
 
-	.gfx_addr(gfx_addr), .gfx_data(gfx_data),
-	.prom_addr(prom_addr), .prom_data(prom_data),
+	.sdram_rd2_req(sdram_rd2_req), .sdram_rd2_ack(sdram_rd2_ack),
+	.sdram_rd2_addr(sdram_rd2_addr), .sdram_rd2_data(sdram_rd2_data),
+	.sdram_rd2_data16(sdram_rd2_data16),
+	.sdram_rd2_data16_hi(sdram_rd2_data16_hi),
+	.fetch_busy(),
+	.rbuf_count_out(),
 
-	.raster_line(),
-
-	.dbg_bank(5'd0), .dbg_cpu_active(1'b0), .dbg_pc(16'd0), .dbg_irq_cnt(8'd0),
-	.dbg_read_gin0(1'b0), .dbg_read_gin1(1'b0), .dbg_mcont_wr(1'b0),
-	.dbg_ever_cram(1'b0), .dbg_ever_scroll(1'b0), .dbg_ever_vram(1'b0),
-	.dbg_pc_isr(1'b0), .dbg_rom_byte(8'd0), .dbg_io_addr(8'd0), .dbg_io_rd(1'b0),
-	.dbg_wr_chk(8'd0), .dbg_rd_chk(8'd0), .dbg_chk_done(1'b0), .dbg_chk_match(1'b0),
-	.dbg_wr_chk_even(8'd0), .dbg_rd_chk_even(8'd0), .dbg_chk_match_even(1'b0),
-	.dbg_wr_chk_odd(8'd0), .dbg_rd_chk_odd(8'd0), .dbg_chk_match_odd(1'b0),
-	.dbg_chk_match_q(4'd0), .dbg_chk_done_q(1'b0),
-	.dbg_bt_done(1'b0), .dbg_bt_pass(1'b0), .dbg_bt_readback(8'd0),
-
-	.dbg_s_pc(16'd0), .dbg_s_bank_reg(4'd0), .dbg_s_bank_wr_cnt(8'd0),
-	.dbg_s_bank_max(4'd0), .dbg_s_vram_wr_cnt(16'd0), .dbg_s_banked_read_ever(1'b0),
-
-	.dbg_snd_cmd_hist(32'd0),
-	.dbg_stall_pc(16'd0), .dbg_stall_flags(5'd0), .dbg_stall_bank(3'd0),
-	.dbg_wram_dump(24'd0)
+	.raster_line()
 );
 
 // Sample bg_pen (and the raw fetch internals) once per tile, at the
@@ -220,7 +286,7 @@ always @(posedge clk_sys) begin
 			if (nonzero_count <= 40)
 				$display("t=%0t NONZERO bg_pen tile_col=%0d tile_row=%0d bg_pen=%02x bg_color=%0d prom_byte=%02x gfx0=%02x gfx1=%02x gfx2=%02x",
 				          $time, dut.tile_col, dut.tile_row, dut.bg_pen, dut.bg_color_cur,
-				          dut.prom_byte_next, dut.bg_plane0_cur, dut.bg_plane1_cur, dut.bg_plane2_cur);
+				          dut.prom_byte_next, dut.bg_third0_cur, dut.bg_third1_cur, dut.bg_third2_cur);
 		end
 	end
 end
@@ -239,16 +305,16 @@ always @(posedge clk_sys) begin
 	if (dut.fetch_ph !== fetch_ph_prev) begin
 		fetch_ph_change_count = fetch_ph_change_count + 1;
 		if (fetch_ph_change_count <= 60)
-			$display("t=%0t FETCH_PH %0d->%0d ce_pix=%b col_in_tile=%0d fetch_armed=%b prom_addr_r=%05x gfx_addr_r=%05x",
-			          $time, fetch_ph_prev, dut.fetch_ph, ce_pix, dut.col_in_tile, dut.fetch_armed, dut.prom_addr_r, dut.gfx_addr_r);
+			$display("t=%0t FETCH_PH %0d->%0d ce_pix=%b col_in_tile=%0d rbuf_count=%0d rd2_addr=%05x",
+			          $time, fetch_ph_prev, dut.fetch_ph, ce_pix, dut.col_in_tile, dut.rbuf_count, dut.sdram_rd2_addr_r);
 		fetch_ph_prev = dut.fetch_ph;
 	end
 	if (ce_pix && dut.col_in_tile == 3'd0 && !HBlank && !VBlank) begin
 		commit_count = commit_count + 1;
 		if (commit_count <= 20)
-			$display("t=%0t COMMIT #%0d tile_col=%0d tile_row=%0d prom_byte_next=%02x gfx0_next=%02x gfx1_next=%02x gfx2_next=%02x fetch_armed=%b",
+			$display("t=%0t COMMIT #%0d tile_col=%0d tile_row=%0d bg_color_cur=%02x bg_third0_cur=%02x bg_third1_cur=%02x bg_third2_cur=%02x rbuf_count=%0d",
 			          $time, commit_count, dut.tile_col, dut.tile_row,
-			          dut.prom_byte_next, dut.gfx0_next, dut.gfx1_next, dut.gfx2_next, dut.fetch_armed);
+			          dut.bg_color_cur, dut.bg_third0_cur, dut.bg_third1_cur, dut.bg_third2_cur, dut.rbuf_count);
 	end
 end
 
@@ -349,6 +415,7 @@ endtask
 // frame. Used for the four steady-state cases (race/winners/track2/
 // fine-offset) -- each waits settle=2 frames from a freshly-zeroed
 // frame_count, matching the original single-case script's warm-up.
+integer rd2_ack_count;
 task run_case(input [8*40-1:0] label, input [15:0] sx, input [15:0] sy,
               input [7:0] gb, input [8*64-1:0] fname);
 	begin
@@ -358,13 +425,15 @@ task run_case(input [8*40-1:0] label, input [15:0] sx, input [15:0] sy,
 		frame_count = 0;
 		ppm_capturing = 0;
 		ppm_done      = 0;
+		rd2_ack_count = 0;
 		capture_target_frame = 2;
 		wait (ppm_done);
 		dump_ppm(fname);
-		$display("=== CASE %0s DONE: scroll_x=%04x scroll_y=%04x gfxbank=%02x -> %0s ===",
-		          label, sx, sy, gb, fname);
+		$display("=== CASE %0s DONE: scroll_x=%04x scroll_y=%04x gfxbank=%02x -> %0s rd2_ack_count=%0d ===",
+		          label, sx, sy, gb, fname, rd2_ack_count);
 	end
 endtask
+always @(posedge clk_sys) if (ppm_capturing && sdram_rd2_ack) rd2_ack_count = rd2_ack_count + 1;
 
 // run_switch_case: does NOT reset frame_count or wait for warm-up --
 // changes scroll/gfxbank immediately (mid-stream, as if the Master
